@@ -12,7 +12,7 @@ Manages a local **Unbound** resolver via the `unbound-control` CLI. Minimal repo
 
 ## Ports / backends
 
-Talks to **Unbound** via the `unbound-control` CLI subprocess (`DNSManager`, `src/dns_manager.py`), 15s timeout. Commands: `status`, `list_local_data`, `local_data <entry>`, `local_data_remove <fqdn>`. No port served; no HTTP at all (the only spoke with neither httpx nor requests — `requirements.txt` is just `websockets, python-dotenv`).
+Manages **Unbound** via `UnboundManager` (`src/unbound_manager.py`): writes managed records to a **persisted** conf.d file (`/etc/unbound/conf.d/lm-netbox.conf`, `unbound_conf` config key) and reloads via `unbound-control` — records survive an Unbound reload/restart. Commands: `DNS_SYNC`, `DNS_LIST`, `DNS_ADD`, `DNS_DELETE`, `DNS_STATUS`. No port served. **Reconciled** to the agent-role (`lm/dns`) implementation so the standalone-install and agent-role paths behave identically (previously this repo used an ephemeral `unbound-control local_data` `DNSManager`).
 
 ## Environment variables
 
@@ -28,7 +28,7 @@ None (no installer present).
 
 ## Key files
 
-`src/main.py`, `src/dns_spoke.py`, `src/dns_manager.py`, `src/__init__.py` (empty), `.env.template`, `requirements.txt`, `VERSION`.
+`src/main.py`, `src/dns_spoke.py`, `src/unbound_manager.py`, `src/__init__.py` (empty), `.env.template`, `requirements.txt`, `VERSION`.
 
 ## Notable behaviors & gotchas
 
