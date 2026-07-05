@@ -52,7 +52,9 @@ class DNSControlPlane(BaseControlPlane):
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.module_type = "dns"
         self.config = {
-            "UNBOUND_CONTROL": os.getenv("UNBOUND_CONTROL", "unbound-control"),
+            # Persisted Unbound: records are written to a conf.d file (survives
+            # reload/restart), matching the agent-role (lm/dns) implementation.
+            "unbound_conf": os.getenv("UNBOUND_CONF", "/etc/unbound/conf.d/lm-netbox.conf"),
         }
 
     async def run(self):
