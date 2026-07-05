@@ -130,6 +130,96 @@ class UnboundManager:
             "conf_path":    self.conf_path,
         }
 
+    # ── Statistics & forwarders ───────────────────────────────────────
+
+    def get_stats(self) -> dict:
+        """Unbound query statistics via ``unbound-control stats_noreset``.
+
+        Parses the flat ``key=value`` output into headline metrics (total
+        queries, cache hit/miss + ratio, recursion latency, uptime) plus a
+        per-record-type query breakdown for the UI — the DNS analog of the
+        OPNsense resolver stats. ``stats_noreset`` leaves Unbound's counters
+        intact so repeated polls don't zero them.
+        """
+        try:
+            result = subprocess.run(
+                ["unbound-control", "stats_noreset"],
+                capture_output=True, text=True, timeout=8,
+            )
+            if result.returncode != 0:
+                return {"status": "ERROR", "message": result.stderr.strip() or "unbound-control failed"}
+        except Exception as e:
+            logger.error("get_stats failed: %s", e)
+            return {"status": "ERROR", "message": str(e)}
+
+        raw = {}
+        for line in result.stdout.splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                try:
+                    raw[k.strip()] = float(v.strip())
+                except ValueError:
+                    raw[k.strip()] = v.strip()
+
+        def n(key):
+            v = raw.get(key, 0)
+            return v if isinstance(v, (int, float)) else 0
+
+        hits   = n("total.num.cachehits")
+        misses = n("total.num.cachemiss")
+        total  = n("total.num.queries")
+        hit_ratio = round(hits / total * 100, 1) if total else 0.0
+
+        query_types = {}
+        for k, v in raw.items():
+            m = re.match(r"num\.query\.type\.(\w+)$", k)
+            if m and isinstance(v, (int, float)) and v:
+                query_types[m.group(1)] = int(v)
+
+        return {
+            "status": "SUCCESS",
+            "global": {
+                "total_queries":     int(total),
+                "cache_hits":        int(hits),
+                "cache_misses":      int(misses),
+                "cache_hit_ratio":   hit_ratio,
+                "num_recursive":     int(n("total.num.recursivereplies")),
+                "recursion_time_avg": round(n("total.recursion.time.avg"), 4),
+                "prefetch":          int(n("total.num.prefetch")),
+                "uptime_seconds":    int(n("time.up")),
+            },
+            "query_types": query_types,
+        }
+
+    def list_forwarders(self) -> dict:
+        """Configured upstream forwarders via ``unbound-control list_forwards``.
+
+        Output lines look like ``. IN forward 8.8.8.8 8.8.4.4`` (zone, class,
+        ``forward``, then the upstream servers). Normalized to a per-zone list
+        of upstreams for the UI's Upstream Servers panel.
+        """
+        try:
+            result = subprocess.run(
+                ["unbound-control", "list_forwards"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                return {"status": "ERROR", "message": result.stderr.strip() or "unbound-control failed"}
+        except Exception as e:
+            logger.error("list_forwarders failed: %s", e)
+            return {"status": "ERROR", "message": str(e)}
+
+        forwarders = []
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[2] == "forward":
+                forwarders.append({
+                    "zone":      parts[0],
+                    "class":     parts[1],
+                    "upstreams": parts[3:],
+                })
+        return {"status": "SUCCESS", "forwarders": forwarders}
+
     # ── Helpers ───────────────────────────────────────────────────────
 
     def _reload(self):

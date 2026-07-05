@@ -76,6 +76,12 @@ class DNSSpoke(BaseSpoke):
         if cmd == "DNS_STATUS":
             return {"status": "SUCCESS", **self.mgr.status()}
 
+        if cmd == "DNS_STATS":
+            return self.mgr.get_stats()
+
+        if cmd == "DNS_FORWARDERS":
+            return self.mgr.list_forwarders()
+
         return {"status": "ERROR", "error": f"Unknown command: {command_type}"}
 
     async def get_status(self) -> Dict[str, Any]:
