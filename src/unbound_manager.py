@@ -14,6 +14,13 @@ class UnboundManager:
     def __init__(self, conf_path: str = LM_CONF):
         self.conf_path = conf_path
         os.makedirs(os.path.dirname(self.conf_path), exist_ok=True)
+        # mtime-keyed memo for list_records(): status/add/update/delete all
+        # call list_records (some indirectly via sync), and each call re-reads
+        # + regex-parses the whole conf. Cache the parsed list keyed on the
+        # conf's st_mtime so it's reused until the file changes; sync() writes
+        # the file and clears the memo so the next read re-parses.
+        self._records_cache = None      # list
+        self._records_cache_mtime = None  # float | None
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -50,14 +57,29 @@ class UnboundManager:
 
         count = len(records)
         self._reload()
+        # We just rewrote the conf — drop the parsed-list memo so the next
+        # list_records re-reads the new contents rather than returning stale.
+        self._records_cache = None
+        self._records_cache_mtime = None
         logger.info("Synced %d DNS records to Unbound", count)
         return {"status": "SUCCESS", "records_written": count}
 
     def list_records(self) -> list:
-        """Parse the managed conf file and return records."""
+        """Parse the managed conf file and return records.
+
+        Memoized on the conf file's mtime: a hit (same mtime as last parse)
+        returns the cached list without re-reading/re-parsing — status/add/
+        update/delete all flow through here, and the conf only changes when
+        sync() rewrites it (which clears the memo)."""
+        try:
+            mtime = os.stat(self.conf_path).st_mtime
+        except FileNotFoundError:
+            self._records_cache = None
+            self._records_cache_mtime = None
+            return []
+        if self._records_cache is not None and self._records_cache_mtime == mtime:
+            return self._records_cache
         records = []
-        if not os.path.exists(self.conf_path):
-            return records
         with open(self.conf_path) as f:
             for line in f:
                 line = line.strip()
@@ -77,6 +99,8 @@ class UnboundManager:
                         "type":  "PTR",
                         "value": m2.group(3).rstrip("."),
                     })
+        self._records_cache = records
+        self._records_cache_mtime = mtime
         return records
 
     def add_record(self, name: str, rtype: str, value: str, ttl: int = 300) -> dict:
