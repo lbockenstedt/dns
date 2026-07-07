@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Any, Dict
 
@@ -41,12 +42,20 @@ class DNSSpoke(BaseSpoke):
         if cmd == "GET_VERSION":
             return {"status": "SUCCESS", "version": self.get_version()}
 
+        # UnboundManager does sync subprocess.run (unbound-control reload/status/
+        # stats_noreset/list_forwards, 5-10s timeouts) + sync conf writes. This
+        # role runs on the lm-svcs agent's ONE shared event loop alongside the
+        # dhcp + base role sub-spokes; a hung unbound-control reload blocks the
+        # whole loop and the hub's 5s request_response fires for every in-flight
+        # request across all three sub-spokes at once. Offload each mgr call to a
+        # worker thread so the loop keeps servicing the other roles + the hub link.
         if cmd == "DNS_SYNC":
             records = data.get("records", [])
-            return self.mgr.sync(records)
+            return await asyncio.to_thread(self.mgr.sync, records)
 
         if cmd == "DNS_LIST":
-            return {"status": "SUCCESS", "records": self.mgr.list_records()}
+            records = await asyncio.to_thread(self.mgr.list_records)
+            return {"status": "SUCCESS", "records": records}
 
         if cmd == "DNS_ADD":
             name  = data.get("name")
@@ -55,7 +64,7 @@ class DNSSpoke(BaseSpoke):
             ttl   = int(data.get("ttl", 300))
             if not name or not value:
                 return {"status": "ERROR", "message": "name and value are required"}
-            return self.mgr.add_record(name, rtype, value, ttl)
+            return await asyncio.to_thread(self.mgr.add_record, name, rtype, value, ttl)
 
         if cmd == "DNS_UPDATE":
             name  = data.get("name")
@@ -64,28 +73,31 @@ class DNSSpoke(BaseSpoke):
             ttl   = int(data.get("ttl", 300))
             if not name or not value:
                 return {"status": "ERROR", "message": "name and value are required"}
-            return self.mgr.update_record(name, rtype, value, ttl)
+            return await asyncio.to_thread(self.mgr.update_record, name, rtype, value, ttl)
 
         if cmd == "DNS_DELETE":
             name  = data.get("name")
             rtype = data.get("type")
             if not name:
                 return {"status": "ERROR", "message": "name is required"}
-            return self.mgr.delete_record(name, rtype)
+            return await asyncio.to_thread(self.mgr.delete_record, name, rtype)
 
         if cmd == "DNS_STATUS":
-            return {"status": "SUCCESS", **self.mgr.status()}
+            s = await asyncio.to_thread(self.mgr.status)
+            return {"status": "SUCCESS", **s}
 
         if cmd == "DNS_STATS":
-            return self.mgr.get_stats()
+            return await asyncio.to_thread(self.mgr.get_stats)
 
         if cmd == "DNS_FORWARDERS":
-            return self.mgr.list_forwarders()
+            return await asyncio.to_thread(self.mgr.list_forwarders)
 
         return {"status": "ERROR", "error": f"Unknown command: {command_type}"}
 
     async def get_status(self) -> Dict[str, Any]:
-        s = self.mgr.status()
+        # Polled by the hub for telemetry — offload the sync unbound-control
+        # status subprocess off the shared loop (same reason as handle_command).
+        s = await asyncio.to_thread(self.mgr.status)
         return {
             "spoke_id":     self.spoke_id,
             "module":       "dns",
