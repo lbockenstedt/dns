@@ -24,11 +24,15 @@ class DNSSpoke(BaseSpoke):
     is reloaded after every write.
 
     Commands:
+      GET_VERSION       — spoke/version string
       DNS_SYNC          — replace all managed records (list of record dicts)
-      DNS_LIST          — return all managed records
-      DNS_ADD           — add a single record
+      DNS_LIST          — return all managed records (parsed from the conf file)
+      DNS_ADD           — add a single record (A/AAAA auto-write a PTR companion)
+      DNS_UPDATE        — replace first record matching name+type (delete-then-add)
       DNS_DELETE        — delete a record by name (+ optional type)
       DNS_STATUS        — Unbound process status + record count
+      DNS_STATS         — unbound-control stats_noreset counters for the WebUI
+      DNS_FORWARDERS    — unbound-control list_forwards upstream resolvers
     """
 
     def __init__(self, spoke_id: str, config: Dict[str, Any]):
@@ -37,6 +41,14 @@ class DNSSpoke(BaseSpoke):
         self.mgr = UnboundManager(conf_path=conf_path)
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch a hub command to the Unbound manager.
+
+        Every ``UnboundManager`` call is offloaded to a worker thread via
+        ``asyncio.to_thread``: ``unbound-control`` is a sync subprocess and this
+        role shares one event loop with the dhcp + base role sub-spokes, so a
+        hung reload/status would otherwise block every in-flight request across
+        all three sub-spokes.
+        """
         cmd = command_type.upper()
 
         if cmd == "GET_VERSION":
