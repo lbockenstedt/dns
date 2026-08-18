@@ -25,6 +25,7 @@ class UnboundManager:
         Forward (A/AAAA) and reverse (PTR) records are both written.
         """
         lines = ["# Managed by Lab Manager — do not edit manually\n", "server:\n"]
+        count = 0
         for r in records:
             name = r.get("name", "").strip().rstrip(".")
             rtype = r.get("type", "A").upper()
@@ -35,20 +36,23 @@ class UnboundManager:
 
             if rtype in ("A", "AAAA"):
                 lines.append(f'    local-data: "{name}. {ttl} IN {rtype} {value}"\n')
+                count += 1
                 ptr = self._ptr_name(value)
                 if ptr:
                     lines.append(f'    local-data-ptr: "{value} {ttl} {name}."\n')
+                    count += 1
 
             elif rtype == "CNAME":
                 lines.append(f'    local-data: "{name}. {ttl} IN CNAME {value.rstrip(".")}."\n')
+                count += 1
 
             elif rtype == "PTR":
                 lines.append(f'    local-data: "{name}. {ttl} IN PTR {value.rstrip(".")}."\n')
+                count += 1
 
         with open(self.conf_path, "w") as f:
             f.writelines(lines)
 
-        count = len(records)
         self._reload()
         logger.info("Synced %d DNS records to Unbound", count)
         return {"status": "SUCCESS", "records_written": count}
