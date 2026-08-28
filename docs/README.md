@@ -1,3 +1,8 @@
+---
+summary: "Doc index for the dns repo: links to this module's feature reference and the shared LM architecture/topology page."
+keywords: [dns, documentation, index]
+---
+
 # dns — docs
 
 This repo carries a copy of its LM feature page plus the shared topology page:
