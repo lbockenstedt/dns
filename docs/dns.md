@@ -1,3 +1,8 @@
+---
+summary: "DNS spoke managing a local Unbound resolver. Repo: dns. moduletype = 'dns'. See architecture-topology.md."
+keywords: [auto, backends, behaviors, dns, dns_delete, dns_forwarders, dns_update, list_forwards, lm, stats_noreset]
+---
+
 # dns — DNS (Unbound)
 
 DNS spoke managing a local Unbound resolver. Repo: `dns`. `module_type = "dns"`. See [architecture-topology.md](architecture-topology.md).
