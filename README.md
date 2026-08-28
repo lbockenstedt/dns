@@ -30,3 +30,10 @@ sudo bash /opt/lm/dns/install_dns.sh --hub lm-hub.lrbtechnologies.com
 
 > A second copy of this source also lives at `lm/dns/`. The two drift deliberately; don't delete either.
 <!-- INSTALLERS:END -->
+
+## Branches
+
+This repo follows the workspace-wide `dev` → `qa` → `main` flow. Contributors
+push to `dev`; promotion into `qa` and `main` happens through automated PRs.
+`VERSION` is branch-owned — a version set on `dev` never propagates to `qa` or
+`main`. See `docs/ci-cd-pipeline.md` in the `nw` repo.
