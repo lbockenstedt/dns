@@ -33,6 +33,7 @@ class DNSSpoke(BaseSpoke):
       DNS_STATUS        — Unbound process status + record count
       DNS_STATS         — unbound-control stats_noreset counters for the WebUI
       DNS_FORWARDERS    — unbound-control list_forwards upstream resolvers
+      DNS_DIAGNOSTICS   — service/config/listener/query health evidence
     """
 
     def __init__(self, spoke_id: str, config: Dict[str, Any]):
@@ -97,6 +98,9 @@ class DNSSpoke(BaseSpoke):
         if cmd == "DNS_STATUS":
             s = await asyncio.to_thread(self.mgr.status)
             return {"status": "SUCCESS", **s}
+
+        if cmd == "DNS_DIAGNOSTICS":
+            return await asyncio.to_thread(self.mgr.diagnostics)
 
         if cmd == "DNS_STATS":
             return await asyncio.to_thread(self.mgr.get_stats)
