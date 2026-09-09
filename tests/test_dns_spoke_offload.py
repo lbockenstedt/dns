@@ -76,6 +76,11 @@ class FakeMgr:
         self._tid()
         return {"status": "SUCCESS", "forwarders": []}
 
+    def diagnostics(self):
+        self.calls.append(("diagnostics",))
+        self._tid()
+        return {"status": "SUCCESS", "healthy": True}
+
 
 @pytest.fixture
 def spoke(tmp_path):
@@ -165,6 +170,12 @@ def test_dns_status_offloaded_and_spread(spoke, loop):
     assert resp["status"] == "SUCCESS"
     assert resp["running"] is True
     assert resp["record_count"] == 3
+    _assert_offloaded(spoke, loop)
+
+
+def test_dns_diagnostics_offloaded(spoke, loop):
+    resp = _run(loop, spoke.handle_command("DNS_DIAGNOSTICS", {}))
+    assert resp == {"status": "SUCCESS", "healthy": True}
     _assert_offloaded(spoke, loop)
 
 
