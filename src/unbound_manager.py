@@ -3,6 +3,9 @@ import logging
 import os
 import re
 import ipaddress
+import socket
+import struct
+import time
 
 logger = logging.getLogger("UnboundManager")
 
@@ -142,6 +145,89 @@ class UnboundManager:
             "conf_path":    self.conf_path,
         }
 
+    def diagnostics(self) -> dict:
+        """Return actionable Unbound service, config, listener, and query checks."""
+        service = self._run_diag(["systemctl", "is-active", "unbound"])
+        config = self._run_diag(["unbound-checkconf"])
+        control = self._run_diag(["unbound-control", "status"])
+        sockets = self._run_diag(["ss", "-H", "-lntup"])
+        if not sockets["ok"]:
+            sockets = self._run_diag(["ss", "-H", "-lntu"])
+
+        listener_lines = [
+            line.strip() for line in sockets["output"].splitlines()
+            if re.search(r"(?:\]:|:)53(?:\s|$)", line)
+        ]
+        lan_addresses = self._local_ipv4s()
+        probes = [self._dns_probe("127.0.0.1")]
+        probes.extend(self._dns_probe(addr) for addr in lan_addresses)
+
+        root_conf = "/etc/unbound/unbound.conf"
+        interfaces = []
+        access_controls = []
+        try:
+            with open(root_conf, encoding="utf-8") as fh:
+                for line in fh:
+                    m = re.match(r"\s*interface:\s*(\S+)", line)
+                    if m:
+                        interfaces.append(m.group(1))
+                    m = re.match(r"\s*access-control:\s*(\S+\s+\S+)", line)
+                    if m:
+                        access_controls.append(m.group(1))
+        except OSError:
+            pass
+
+        has_listener = bool(listener_lines)
+        listener_hosts = [self._listener_host(line) for line in listener_lines]
+        has_lan_listener = any(
+            host and not host.startswith("127.") and host != "::1"
+            for host in listener_hosts
+        )
+        lan_probe_ok = any(
+            p["responded"] for p in probes if p["server"] != "127.0.0.1"
+        )
+        recommendations = []
+        if not service["ok"]:
+            recommendations.append(
+                "Unbound is not active; inspect the service error and restart it.")
+        if not config["ok"]:
+            recommendations.append(
+                "Unbound configuration is invalid; fix the reported checkconf error.")
+        if not has_listener:
+            recommendations.append(
+                "Nothing is listening on TCP/UDP port 53.")
+        elif not has_lan_listener:
+            recommendations.append(
+                "Port 53 is only bound to loopback; configure a LAN listener.")
+        if lan_addresses and not lan_probe_ok:
+            recommendations.append(
+                "The local LAN-address DNS probe received no response; check the "
+                "listener owner, Unbound access-control, and host firewall.")
+
+        return {
+            "status": "SUCCESS",
+            "healthy": (
+                service["ok"] and config["ok"] and has_lan_listener
+                and (lan_probe_ok if lan_addresses else False)
+            ),
+            "service": service,
+            "config": config,
+            "control": control,
+            "sockets": {
+                "ok": sockets["ok"],
+                "error": sockets["error"],
+                "listeners": listener_lines,
+                "has_port_53_listener": has_listener,
+                "has_lan_listener": has_lan_listener,
+            },
+            "configured_interfaces": interfaces,
+            "access_controls": access_controls,
+            "local_ipv4s": lan_addresses,
+            "probes": probes,
+            "recommendations": recommendations,
+            "conf_path": self.conf_path,
+        }
+
     # ── Statistics & forwarders ───────────────────────────────────────
 
     def get_stats(self) -> dict:
@@ -233,6 +319,79 @@ class UnboundManager:
         return {"status": "SUCCESS", "forwarders": forwarders}
 
     # ── Helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _run_diag(cmd, timeout=5):
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout)
+            output = (result.stdout or result.stderr or "").strip()[:2000]
+            return {
+                "ok": result.returncode == 0,
+                "exit_code": result.returncode,
+                "output": output,
+                "error": "" if result.returncode == 0 else (output or "command failed"),
+            }
+        except Exception as e:
+            return {"ok": False, "exit_code": None, "output": "", "error": str(e)}
+
+    @staticmethod
+    def _listener_host(line):
+        for token in line.split():
+            if re.search(r":53$", token):
+                host = token.rsplit(":", 1)[0].strip("[]")
+                return host.split("%", 1)[0]
+        return ""
+
+    def _local_ipv4s(self):
+        result = self._run_diag(["ip", "-o", "-4", "addr", "show", "scope", "global"])
+        if not result["ok"]:
+            return []
+        addresses = []
+        for line in result["output"].splitlines():
+            match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", line)
+            if match and not ipaddress.ip_address(match.group(1)).is_loopback:
+                addresses.append(match.group(1))
+        return sorted(set(addresses))
+
+    @staticmethod
+    def _dns_probe(server, name="localhost"):
+        started = time.monotonic()
+        txid = time.monotonic_ns() & 0xFFFF
+        labels = name.rstrip(".").split(".")
+        question = b"".join(
+            bytes([len(label)]) + label.encode("ascii") for label in labels
+        ) + b"\x00" + struct.pack("!HH", 1, 1)
+        packet = struct.pack("!HHHHHH", txid, 0x0100, 1, 0, 0, 0) + question
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(2)
+        try:
+            sock.sendto(packet, (server, 53))
+            response, _ = sock.recvfrom(4096)
+            if len(response) < 12:
+                raise ValueError("short DNS response")
+            reply_id, flags, _, answers, _, _ = struct.unpack("!HHHHHH", response[:12])
+            if reply_id != txid:
+                raise ValueError("DNS transaction ID mismatch")
+            return {
+                "server": server,
+                "responded": True,
+                "rcode": flags & 0xF,
+                "answers": answers,
+                "latency_ms": round((time.monotonic() - started) * 1000, 1),
+                "error": "",
+            }
+        except Exception as e:
+            return {
+                "server": server,
+                "responded": False,
+                "rcode": None,
+                "answers": 0,
+                "latency_ms": round((time.monotonic() - started) * 1000, 1),
+                "error": str(e),
+            }
+        finally:
+            sock.close()
 
     def _reload(self):
         try:
