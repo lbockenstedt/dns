@@ -47,6 +47,8 @@ DNS_WORKER_OPS = (
     "DNSW_DIAGNOSTICS",  # full local diagnostics evidence
     "DNSW_STATS",        # unbound-control stats_noreset counters
     "DNSW_FORWARDERS",   # unbound-control list_forwards upstream resolvers
+    "DNSW_FORWARDER_ADD",     # persist one new forwarding zone
+    "DNSW_FORWARDER_REMOVE",  # rollback an LM-managed forwarding zone
     "DNSW_STANDDOWN",    # leave the cluster: forget the applied-version marker
 )
 

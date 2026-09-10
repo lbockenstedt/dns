@@ -123,8 +123,12 @@ class FakeTransport:
                               "query_types": {"A": 10}}
             else:
                 results[m] = {"status": "SUCCESS"}
-        return {"status": "SUCCESS", "results": results,
-                "ok": targets, "failed": []}
+        ok = [member for member, result in results.items()
+              if result.get("status") == "SUCCESS"]
+        failed = [member for member in targets if member not in ok]
+        status = "SUCCESS" if not failed else ("PARTIAL" if ok else "ERROR")
+        return {"status": status, "results": results,
+                "ok": ok, "failed": failed}
 
     async def call(self, member_id, command, data, timeout=20.0):
         out = await self.fanout(command, data, member_ids=[member_id])
@@ -324,6 +328,37 @@ def test_single_host_forwarders_still_use_the_local_manager(tmp_path):
     out = _run(spoke.handle_command("DNS_FORWARDERS", {}))
     assert out["forwarders"][0]["zone"] == "."
     assert ("list_forwarders",) in spoke.mgr.calls
+
+
+def test_clustered_forwarder_add_reaches_every_member(tmp_path):
+    spoke = _spoke(tmp_path, members=("dns-a", "dns-b"))
+
+    out = _run(spoke.handle_command("DNS_FORWARDER_ADD", {
+        "zone": ".", "upstreams": ["1.1.1.1"],
+    }))
+
+    assert out["status"] == "SUCCESS"
+    assert spoke._transport.sent[-1] == (
+        "DNSW_FORWARDER_ADD",
+        {"zone": ".", "upstreams": ["1.1.1.1"]},
+        ("dns-a", "dns-b"),
+    )
+
+
+def test_clustered_forwarder_add_rolls_back_partial_write(tmp_path):
+    spoke = _spoke(tmp_path, members=("dns-a", "dns-b"))
+    spoke._transport.fail_ops.add(("dns-b", "DNSW_FORWARDER_ADD"))
+
+    out = _run(spoke.handle_command("DNS_FORWARDER_ADD", {
+        "zone": ".", "upstreams": ["1.1.1.1"],
+    }))
+
+    assert out["status"] == "ERROR"
+    assert spoke._transport.sent[-1] == (
+        "DNSW_FORWARDER_REMOVE",
+        {"zone": "."},
+        ("dns-a", "dns-b"),
+    )
 
 
 # ── Item 8: fail-closed surfaces as an actionable error ────────────────────

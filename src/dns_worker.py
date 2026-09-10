@@ -173,6 +173,13 @@ class DnsWorkerOps:
         Unbound)."""
         return self.mgr.list_forwarders()
 
+    def add_forwarder(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        return self.mgr.add_forwarder(
+            data.get("zone", "."), data.get("upstreams", []))
+
+    def remove_forwarder(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        return self.mgr.remove_forwarder(data.get("zone", ""))
+
     def op_table(self) -> Dict[str, Any]:
         return {
             "DNSW_APPLY": self.apply,
@@ -181,6 +188,8 @@ class DnsWorkerOps:
             "DNSW_DIAGNOSTICS": self.diagnostics,
             "DNSW_STATS": self.stats,
             "DNSW_FORWARDERS": self.forwarders,
+            "DNSW_FORWARDER_ADD": self.add_forwarder,
+            "DNSW_FORWARDER_REMOVE": self.remove_forwarder,
             "DNSW_STANDDOWN": self.standdown,
         }
 
