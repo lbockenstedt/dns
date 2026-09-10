@@ -1,31 +1,31 @@
 ---
-summary: "DNS spoke managing a local Unbound resolver. Repo: dns. moduletype = 'dns'. See architecture-topology.md."
+summary: "DNS management spoke coordinating one or more Unbound resolver workers. Repo: dns. moduletype = 'dns'."
 keywords: [auto, backends, behaviors, dns, dns_delete, dns_forwarders, dns_update, list_forwards, lm, stats_noreset]
 ---
 
 # dns — DNS (Unbound)
 
-DNS spoke managing a local Unbound resolver. Repo: `dns`. `module_type = "dns"`. See [architecture-topology.md](architecture-topology.md).
+DNS management spoke coordinating Unbound resolvers. Repo: `dns`. `module_type = "dns"`. See [architecture-topology.md](architecture-topology.md).
 
 ## Role & module_type
 
-Manages a local **Unbound** resolver via the `unbound-control` CLI. Minimal repo — no installer, no API_SPEC, no root README.
+The `dns` role is management-only and does not install, start, or invoke a local Unbound service. Resolver workers are deployed separately with the `dns-server` role. Load both roles when management and a resolver intentionally share one host.
 
 ## What it does
 
-The `dns` module manages DNS records on this node's local **Unbound** resolver, and shows query statistics and configured upstream forwarders for troubleshooting. Records are simple name/type/value entries (A/AAAA get an automatic PTR companion; CNAME and PTR are also supported) — add one by hand, or let it fill in automatically from NetBox.
+The `dns` module manages DNS records across one or more **Unbound** resolver workers and shows their query statistics and configured upstream forwarders. Records are simple name/type/value entries (A/AAAA get an automatic PTR companion; CNAME and PTR are also supported) — add one by hand, or let it fill in automatically from NetBox. Global Admins can add persistent per-zone forwarders from the **Forwarders** tab; the change is applied to every resolver worker.
 
-In the WebUI, open a node's **DNS** module from the sidebar to reach the **Records**, **Statistics**, and **Forwarders** tabs — see the [WebUI](#webui) section below for what each tab shows.
+In the WebUI, open a node's **DNS** module from the sidebar to reach the **Records**, **Statistics**, **Diagnostics**, and **Forwarders** tabs — see the [WebUI](#webui) section below for what each tab shows.
 
 ## Entrypoints
 
-`python3 -m src.main` (`DNSControlPlane`); spoke `DNSSpoke(BaseSpoke)`. **No install script** in this repo.
+`python3 -m src.main` (`DNSControlPlane`); spoke `DNSSpoke(BaseSpoke)`. `install_dns.sh` performs Unbound host prep for direct installs and `dns-server`; the agent `dns` role loader installs only management dependencies.
 
-> **Primarily a role now.** DNS runs mainly as the **`dns`** role hosted by the generic agent (`agent-<hostname>`, unit `lm-agent`): the agent opens a sub-spoke `{agent}-dns` (module type `dns`, parent-auto-approved) and loads it in-process via `agent/src/agent_spoke.py::_install_role` (this repo is bundled in-tree; the role loader also does the Unbound host prep). There is no dedicated `lm-dns` unit — the agent role is the standard path; a hand-rolled unit is the only standalone alternative. Config (`UNBOUND_CONTROL` etc.) comes from the hub push (WebUI), not a per-module `.env`.
+> **Primarily a role now.** DNS runs mainly as the **`dns`** role hosted by the agent (`agent-<hostname>`, unit `lm-agent`): the agent opens a management-only sub-spoke `{agent}-dns` (module_type `dns`, parent-auto-approved). Load `dns-server` separately on each resolver worker; load both roles when the coordinator and resolver intentionally share one host. `install_dns.sh` can create a direct local deployment when needed. Config comes from the hub push (WebUI), not a per-module `.env`.
 
 ## Ports / backends
 
-Talks to **Unbound** via the `unbound-control` CLI subprocess (`UnboundManager`, `src/unbound_manager.py`), 5–10s per-call timeouts. Commands actually invoked: `status`, `stats_noreset`, `list_forwards`, `reload`. Individual records are **not** pushed with live `local_data`/`local_data_remove` verbs — they're written into one managed conf.d file (`local-data`/`local-data-ptr` directives) that's fully rewritten and reloaded on every change (see How it works below). No port served; no HTTP at all (the only spoke with neither httpx nor requests — `requirements.txt` is just `websockets, python-dotenv`).
+DNS Management talks to DNS Server workers over its verified TLS listener on port **8769**. Each worker invokes local `unbound-control` (`status`, `stats_noreset`, `list_forwards`, `reload`) and manages its own conf.d file; the management host never invokes local Unbound.
 
 ## Environment variables
 
@@ -37,17 +37,17 @@ None (no installer present).
 
 ## Key commands / handlers (`dns_spoke.handle_command`)
 
-`GET_VERSION`, `UPDATE_CONFIG` (rebuild manager), `DNS_STATUS`, `DNS_LIST` (parses `local-data` directives from the managed conf file — `<name> <ttl> IN <type> <value>`), `DNS_ADD` (`local_data`), `DNS_DELETE` (`local_data_remove`), `DNS_UPDATE` (delete-then-add, non-atomic), `DNS_SYNC` (`sync_records` — only-add-missing against existing names, added/skipped counts), `DNS_STATS` (`get_stats` via `unbound-control stats_noreset` — total queries, cache hit/miss + ratio, recursion latency, uptime, per-type breakdown; relayed by `GET /api/dns/stats`), `DNS_FORWARDERS` (`list_forwarders` via `unbound-control list_forwards` — per-zone upstream servers; relayed by `GET /api/dns/forwarders`).
+`GET_VERSION`, `UPDATE_CONFIG` (rebuild manager), `DNS_STATUS`, `DNS_DIAGNOSTICS` (service/config/control status, port-53 listeners, configured/local addresses, and loopback/LAN DNS probes; relayed by `GET /api/dns/diagnostics`), `DNS_LIST` (regex-parses `local-data:`/`local-data-ptr:` directives out of the managed conf.d file — `<name>. <ttl> IN <type> <value>`; memoized on the conf file's mtime — NOT `unbound-control list_local_data`), `DNS_ADD` (append to the parsed record list + full conf rewrite + `unbound-control reload`), `DNS_DELETE` (filter out the matching record + full conf rewrite + reload), `DNS_UPDATE` (delete-then-add, non-atomic), `DNS_SYNC` (`sync_records` — only-add-missing against existing names, added/skipped counts), `DNS_STATS` (`get_stats` via `unbound-control stats_noreset` — total queries, cache hit/miss + ratio, recursion latency, uptime, per-type breakdown; relayed by `GET /api/dns/stats`), `DNS_FORWARDERS` (`list_forwarders` via `unbound-control list_forwards` — per-zone upstream servers; relayed by `GET /api/dns/forwarders`), and `DNS_FORWARDER_ADD` (Global-Admin-only persistent forwarding-zone creation; relayed by `POST /api/dns/forwarders`).
 
-## Multi-resolver cluster (two Unbound hosts, one DNS module)
+## Resolver workers (one or more Unbound hosts, one DNS module)
 
-A DNS module can drive **two or more Unbound hosts** instead of the one on its own box. It becomes the authoritative owner of the record set and keeps every resolver identical.
+A DNS module drives **one or more Unbound hosts** and becomes the authoritative owner of the record set. Two or more workers provide redundancy and are kept identical.
 
 **Shape.** One `dns` spoke is the **coordinator**; each resolver host runs an `lm-dns-worker` unit that dials the coordinator's `/ws/agent` listener on **8769** (pxmx 8766 / cs 8767 / hub-self 8768 are taken, so the dns and dhcp roles can be co-loaded on one agent). Workers authenticate with a shared PSK and every frame is HMAC-signed — the same machinery pxmx node-agents use (`core/src/messaging/agent_hosting.py` + `core/src/messaging/service_cluster.py`). Workers are **not** spokes: they never appear in the hub registry and tenant routing stays "one tenant → one coordinator".
 
 **The hop is always encrypted AND verified.** The PSK rides in the first handshake frame, so the coordinator URL defaults to `wss://`, a `ws://` URL to a **remote** host is rejected outright, and — unlike the hub leg — there is **no unverified mode at all**. The installer mints (or accepts) a coordinator certificate at `/etc/lm-dns/tls/`, wires it into the unit as `LM_TLS_CERT`/`LM_TLS_KEY`, and each worker install requires `--ca-cert` (that certificate, pinned as `LM_CLUSTER_CA_CERT`). A configured CA path that does not exist fails closed. `LM_CLUSTER_TLS_CHECK_HOSTNAME=0` relaxes only the SAN match for a self-signed-by-IP coordinator; the trust anchor is still enforced. The listener **refuses to bind** plaintext on `0.0.0.0` (`AGENT_LISTENER_REQUIRE_TLS`): with no cert it leaves the port closed and logs why.
 
-**The worker is not a generic agent.** Its op table is fixed at import: `DNSW_APPLY`, `DNSW_STATE`, `DNSW_STATUS`, `DNSW_DIAGNOSTICS`, `DNSW_STATS`, `DNSW_FORWARDERS`, `DNSW_STANDDOWN`. There is no `RUN_COMMAND`, no `WRITE_FILE`, no caller-supplied path or URL. The conf path is fixed at start from local config. Forwarders are per-resolver, so the **Forwarders** tab in cluster mode aggregates `DNSW_FORWARDERS` from every member (tagged with the member it came from) instead of reading the coordinator box's own Unbound, which may not exist.
+**The worker is not a generic agent.** Its op table is fixed at import: `DNSW_APPLY`, `DNSW_STATE`, `DNSW_STATUS`, `DNSW_DIAGNOSTICS`, `DNSW_STATS`, `DNSW_FORWARDERS`, `DNSW_FORWARDER_ADD`, `DNSW_FORWARDER_REMOVE`, `DNSW_STANDDOWN`. There is no `RUN_COMMAND`, no `WRITE_FILE`, no caller-supplied path or URL. The conf path is fixed at start from local config. Forwarders are per-resolver, so the **Forwarders** tab in cluster mode aggregates `DNSW_FORWARDERS` from every member (tagged with the member it came from) instead of reading the coordinator box's own Unbound, which may not exist. Adds fan out to every member and roll back successful members if any resolver rejects the change.
 
 **Desired state — persisted first, fail closed.** Every write (`DNS_SYNC` / `DNS_ADD` / `DNS_UPDATE` / `DNS_DELETE`) lands in the coordinator's versioned, digested desired state (`/var/lib/lm-dns/desired.json`), which is written to disk **before** anything is fanned out: if the write fails, no worker is touched and the coordinator stays exactly where it was. A desired-state file that exists but cannot be read (or whose digest does not match its own records) **blocks every mutation and the reconcile loop** with an actionable error — starting clean there would silently republish an empty record set to both resolvers. Mutations and reconcile passes are serialized under one lock, so two concurrent changes can never interleave their fan-outs. Once persisted the set is fanned out to every member. Records are **validated before they are versioned** — a name or value containing a quote, newline, whitespace or config punctuation is rejected outright, because Unbound's `local-data: "…"` is quote-delimited and line-oriented and would otherwise accept injected directives. An identical re-sync does not bump the version, so the periodic NetBox loop doesn't make every worker look momentarily stale.
 
@@ -57,9 +57,9 @@ A DNS module can drive **two or more Unbound hosts** instead of the one on its o
 
 **Reconcile.** A 30s loop asks each member what it actually has on disk (`DNSW_STATE`) and re-pushes only to members that drifted. That is also the reconnect path: a resolver that reboots reports a stale/absent version and is brought back automatically. `POST /api/dns/cluster/reconcile` forces a pass.
 
-**Configure it.** DNS → **Diagnostics** → *Configure resolver cluster* (Global Admin), or `POST /api/dns/cluster` with `{"members": [{"id","host"}, …], "worker_secret": "…"}`. The secret is write-only — it becomes the listener PSK and is never returned — and it is **required on first enablement**: nothing generates one, because a value the operator cannot read could never be given to the workers. Re-saving with the field blank keeps the stored secret.
+**Configure it.** Active DNS Server roles installed through LM are discovered and enrolled automatically when an administrator opens the DNS module. The generic agent reports its private local service address; the hub never substitutes the public/NAT source address of the agent's WebSocket. DNS Management mints or reuses the worker credential, hands the public coordinator certificate and ephemeral credential to the server agent over the authenticated control channel, and the agent idempotently installs `lm-dns-worker`. After the worker connects, DNS Management adopts its existing records before allowing any mutation; an explicitly unloaded/disabled DNS Server is never re-enabled by discovery. The discovered server is also added to Setup inventory. Worker ID and Worker Secret are only needed for an external/manual resolver that was not installed as an LM role. DNS → **Diagnostics** → *Configure resolver cluster* remains the advanced direct topology editor.
 
-**Enabling adopts what is already live — and never guesses.** On the single-host → cluster transition the coordinator seeds its desired state (as v1) from the records already being served. Every populated source (its own conf and each reachable member) must agree **exactly**; two shapes are explicitly safe — all populated sources identical, or exactly one populated and the rest empty. Anything else **aborts** with a per-source record count and digest, and the module stays single-host until an operator reconciles the resolvers by hand. Adopting the largest set would silently erase every record unique to the smaller one. Until something is committed the reconcile pass **skips** rather than fanning an empty default out over resolvers that are already answering.
+**Enabling adopts what is already live — and never guesses.** On the first worker configuration, the coordinator seeds its desired state from reachable workers. Every populated worker must agree **exactly**; otherwise enablement aborts with a per-source record count and digest. Adopting the largest set would silently erase every record unique to a smaller one. Until something is committed the reconcile pass skips rather than fanning an empty default out over resolvers that are already answering.
 
 **Enabling is one transaction.** Validate → persist topology → bind the listener → seed → stand down removed members all run under the same lock every record apply takes, and the listener is **awaited**: if it does not actually come up (no cert, port in use) the call returns `ERROR` with the reason and the topology is rolled back, rather than reporting success before an asynchronous failure. A rolled-back change also **restores the previous worker PSK** — overwriting it and then reverting the topology would leave every already-provisioned resolver unable to authenticate against a coordinator whose config no longer reflects the change.
 
@@ -71,7 +71,7 @@ A DNS module can drive **two or more Unbound hosts** instead of the one on its o
 sudo bash install_dns.sh --member-id dns-a --coordinator <coordinator-host> --worker-secret <secret>
 ```
 
-…plus `--ca-cert <coordinator cert>`, which is **required** — the worker verifies the coordinator before sending its secret. That installs Unbound **and** the `lm-dns-worker` unit; it implies `--infra-only` (the module lives on the coordinator, not here). The coordinator install creates `/etc/lm-dns`, `/var/lib/lm-dns` and `/etc/lm-dns/tls` owned by `svc_lm`, and mints a self-signed coordinator certificate (override with `--tls-cert`/`--tls-key`/`--tls-san`). Copy `/etc/lm-dns/tls/coordinator.crt` to each resolver and pass it as `--ca-cert`. Fewer than two members = cluster off, and the module behaves exactly as a single-host install: no listener is bound, and every write goes to the local `UnboundManager`.
+…plus `--ca-cert <coordinator cert>`, which is **required** — the worker verifies the coordinator before sending its secret. That installs Unbound **and** the `lm-dns-worker` unit; it implies `--infra-only` (the module lives on the coordinator, not here). Both the hosted management role and standalone coordinator install create `/etc/lm-dns/tls` and mint a self-signed coordinator certificate when one is absent (standalone installs may override it with `--tls-cert`/`--tls-key`/`--tls-san`). Copy `/etc/lm-dns/tls/coordinator.crt` to each resolver and pass it as `--ca-cert`. One configured worker enables remote management; two or more add redundancy.
 
 **See it.** DNS → **Diagnostics** grows a *Resolver cluster* panel (per-member convergence, applied version + digest, Unbound up/down, last-seen, and the last commit's per-member errors) plus each member's own diagnostics findings. `GET /api/dns/cluster` returns the same report; Settings → Diagnostics carries a one-line summary. A non-admin sees the verdict but not member hostnames, digests or error text.
 
@@ -82,7 +82,7 @@ NetBox is the IPAM source of truth. The hub's `DnsDhcpSyncMixin` (`core/src/dns_
 
 ## WebUI
 
-Module view tabs: **Records**, **Statistics** (total-queries / cache-hit-ratio / recursion / uptime tiles + queries-by-type breakdown, `GET /api/dns/stats`), **Forwarders** (per-zone upstream resolvers, `GET /api/dns/forwarders`).
+Module view tabs: **Records**, **Statistics** (total-queries / cache-hit-ratio / recursion / uptime tiles + queries-by-type breakdown, `GET /api/dns/stats`), **Diagnostics** (live service/config checks, port-53 listener ownership, detected LAN addresses, local query probes, and recommended checks), **Forwarders** (per-zone upstream resolvers, `GET /api/dns/forwarders`), and **External DNS** (internet-facing DNS providers such as HE.NET — appears once an external-DNS spoke is connected; one tile per provider; see [henet.md](henet.md)).
 
 ## Key files
 
@@ -97,7 +97,7 @@ Module view tabs: **Records**, **Statistics** (total-queries / cache-hit-ratio /
 
 ## How it works
 
-- **Where it runs.** Standard path: the **`dns`** role on the generic agent (unit `lm-agent`) opens a sub-spoke `{agent}-dns` (parent-auto-approved) and loads this repo in-process via `agent_spoke.py::_install_role`. Rare alternative: a hand-rolled `lm-dns` unit running `python3 -m src.main` (`DNSControlPlane`) standalone.
+- **Where it runs.** Standard path: the **`dns`** role on the agent (unit `lm-agent`) opens a sub-spoke `{agent}-dns` (parent-auto-approved) and loads this repo in-process via `agent_spoke.py::_install_role`. Rare alternative: a hand-rolled `lm-dns` unit running `python3 -m src.main` (`DNSControlPlane`) standalone.
 - **Config delivery.** The hub pushes config with `UPDATE_CONFIG` (rebuilds the `UnboundManager` with the configured conf path) — there's no per-module `.env` to hand-edit on the box; `UNBOUND_CONF` env var is only the fallback default before a push arrives.
 - **Command flow.** WebUI/hub issues one command at a time over the hub↔spoke session: `GET_VERSION`, `UPDATE_CONFIG`, `DNS_STATUS`, `DNS_LIST`, `DNS_ADD`, `DNS_DELETE`, `DNS_UPDATE`, `DNS_SYNC`, `DNS_STATS`, `DNS_FORWARDERS`.
 - **How records are actually written.** `UnboundManager` keeps exactly **one** managed conf.d file (default `/etc/unbound/conf.d/lm-netbox.conf`, overridable). Every add/update/delete/sync:
@@ -110,7 +110,7 @@ Module view tabs: **Records**, **Statistics** (total-queries / cache-hit-ratio /
 - **Stats and forwarders bypass the managed file entirely** — `DNS_STATS` shells out to `unbound-control stats_noreset` (non-destructive counters) and `DNS_FORWARDERS` to `unbound-control list_forwards`, both reading live daemon state, not the conf.d file.
 - **NetBox auto-sync loop** (see the section above) and the on-demand Sync button both ultimately call `DNS_SYNC` with the same only-add-missing logic via the shared `build_dns_records` helper — an IP only contributes a record when it has *both* a `dns_name` and a concrete address, so they can never diverge or race each other.
 - **Stats source in detail.** `DNS_STATS` parses `unbound-control stats_noreset`'s flat `key=value` output into `total_queries`, `cache_hits`/`cache_misses`/`cache_hit_ratio`, `num_recursive`, `recursion_time_avg`, `prefetch`, `uptime_seconds`, plus a per-query-type breakdown — relayed to the WebUI via `GET /api/dns/stats`.
-- **Forwarders in detail.** `DNS_FORWARDERS` parses `unbound-control list_forwards` lines (e.g. `. IN forward 8.8.8.8 8.8.4.4`) into a per-zone list of upstream servers — relayed via `GET /api/dns/forwarders`.
+- **Forwarders in detail.** `DNS_FORWARDERS` parses `unbound-control list_forwards` lines (e.g. `. IN forward 8.8.8.8 8.8.4.4`) into a per-zone list of upstream servers — relayed via `GET /api/dns/forwarders`. Global Admins can add a zone with one or more IPv4/IPv6 upstreams through `POST /api/dns/forwarders`; each worker persists it in `/etc/unbound/conf.d/lm-forwarders.conf` and reloads Unbound. A partial cluster write is rolled back.
 
 ## How to use it
 
@@ -125,8 +125,8 @@ Module view tabs: **Records**, **Statistics** (total-queries / cache-hit-ratio /
 ## Troubleshooting / common questions
 
 - **"I added a record in NetBox but never touched the DNS module — why is it already in Unbound?"** The NetBox → Unbound auto-sync loop (default every 300s) picked it up: any IP with a `dns_name` set gets added automatically — see the NetBox auto-sync section above. Check `GET /api/dns-dhcp/sync-status` for the last run's timing and result, or just press **Sync now** instead of waiting.
-- **"I added/edited a record but the Records tab (or `DNS_LIST`) shows nothing at all."** Check that Unbound is actually running on the node hosting the `dns` role, and that `unbound-control` has permission to talk to it. `list_records` swallows any read failure of the managed conf file (missing file, permission denied, Unbound not started) and just returns an empty list — there's no visible error, the symptom is simply "records list is empty." Run `unbound-control status` directly on the box and confirm the account running the `dns` role can read/write the managed conf path (default `/etc/unbound/conf.d/lm-netbox.conf`, or your `UNBOUND_CONF` override).
-- **"The DNS module shows offline/red in the WebUI."** The `{agent}-dns` sub-spoke isn't connected to the hub. Check the node's `lm-agent` unit first — the `dns` role rides on it and is loaded in-process, so an agent-wide outage takes DNS down with it. A `dns`-only failure independent of the agent is unusual unless this node uses the rare standalone hand-rolled `lm-dns` unit.
+- **"I added/edited a record but the Records tab (or `DNS_LIST`) shows nothing at all."** Confirm at least one DNS Server worker is configured and connected in DNS → Diagnostics.
+- **"The DNS module shows offline/red in the WebUI."** The `{agent}-dns` sub-spoke isn't connected to the hub. Check the node's `lm-agent` unit first — the `dns` role rides on it and is loaded in-process, so an agent-wide outage takes DNS down with it. A `dns`-only failure independent of the agent is unusual unless this node uses the rare standalone `lm-dhcp`-style hand-rolled `lm-dns` unit.
 - **"Records I added by hand disappeared after a sync."** Sync (both the loop and the button) is only-add-missing — it never deletes. If a manually-added record vanished, check whether someone ran an explicit `DNS_UPDATE`/`DNS_DELETE` on it (those are the only paths that touch existing entries), and remember the managed conf.d file is fully regenerated on every write — anything edited directly on the box outside the DNS module (bypassing Lab Manager entirely) will get clobbered on the next write.
 - **"Is this dnsmasq or Unbound?"** Unbound — confirmed by the `unbound-control` CLI dependency and the `status`/`stats_noreset`/`list_forwards`/`reload` verbs it actually issues. There is no dnsmasq involved in this module.
 - **"Why is `DNS_UPDATE` described as delete-then-add / non-atomic?"** Functionally it replaces the first record matching name+type (dropping duplicates, adding if no match) and then does one rewrite + one reload — so Unbound itself never serves a half-updated file. The "non-atomic" framing refers to the record-list logic (remove old entry, add new one) rather than two separate live `unbound-control` calls.
