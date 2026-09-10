@@ -453,6 +453,29 @@ class DNSSpoke(BaseSpoke):
         return {"status": "SUCCESS", "forwarders": forwarders, "cluster": True,
                 "members": per_member, "member_errors": errors}
 
+    async def _cluster_add_forwarder(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        fan = await self._transport.fanout(
+            "DNSW_FORWARDER_ADD", data, timeout=20.0)
+        if not fan.get("failed"):
+            return {"status": "SUCCESS", "zone": data.get("zone"),
+                    "upstreams": data.get("upstreams"), "members": fan["results"]}
+        ambiguous = [
+            member_id for member_id in (fan.get("failed") or [])
+            if "changed" not in (fan.get("results", {}).get(member_id) or {})
+        ]
+        rollback_ids = [*(fan.get("ok") or []), *ambiguous]
+        rollback = {"status": "SUCCESS", "ok": [], "failed": [], "results": {}}
+        if rollback_ids:
+            rollback = await self._transport.fanout(
+                "DNSW_FORWARDER_REMOVE", {"zone": data.get("zone")},
+                timeout=20.0, member_ids=rollback_ids)
+        failed = ", ".join(fan.get("failed") or [])
+        message = f"forwarder was not added to all resolvers ({failed})"
+        if rollback.get("failed"):
+            message += "; rollback also failed on " + ", ".join(rollback["failed"])
+        return {"status": "ERROR", "message": message,
+                "members": fan["results"], "rollback": rollback}
+
     async def _cluster_status_summary(self) -> Dict[str, Any]:
         """DNS_STATUS in cluster mode — never one host's answer for the pair."""
         await self.cluster.refresh_state()
@@ -534,6 +557,8 @@ class DNSSpoke(BaseSpoke):
                 return await self._cluster_stats()
             if cmd == "DNS_FORWARDERS":
                 return await self._cluster_forwarders()
+            if cmd == "DNS_FORWARDER_ADD":
+                return await self._cluster_add_forwarder(data)
 
         # UnboundManager does sync subprocess.run (unbound-control reload/status/
         # stats_noreset/list_forwards, 5-10s timeouts) + sync conf writes. This
@@ -587,6 +612,13 @@ class DNSSpoke(BaseSpoke):
 
         if cmd == "DNS_FORWARDERS":
             return await asyncio.to_thread(self.mgr.list_forwarders)
+
+        if cmd == "DNS_FORWARDER_ADD":
+            return await asyncio.to_thread(
+                self.mgr.add_forwarder,
+                data.get("zone", "."),
+                data.get("upstreams", []),
+            )
 
         return {"status": "ERROR", "error": f"Unknown command: {command_type}"}
 
