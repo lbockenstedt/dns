@@ -11,6 +11,25 @@ logger = logging.getLogger("UnboundManager")
 
 LM_CONF = "/etc/unbound/conf.d/lm-netbox.conf"
 UNBOUND_CONF_DIR = "/etc/unbound/conf.d"
+LOGGING_CONF = "/etc/unbound/conf.d/lm-logging.conf"
+QUERY_LOG = "/var/log/unbound/lm-queries.log"
+
+# unbound-control's stats_noreset is aggregate-only (per-type/rcode/etc.) and
+# cannot report counts per queried NAME. The only way to get that is Unbound's
+# own query log (`log-queries: yes`), tailed incrementally. Cap the number of
+# distinct names tracked in memory so a noisy/adversarial resolver can't grow
+# this unbounded; once the cap is hit, stop accepting brand-new names until the
+# next reset (an operator can always bump/relax this via get_stats(reset=True)
+# or a service restart) rather than silently evicting existing counts.
+MAX_TRACKED_NAMES = 5000
+# The API response itself is further truncated to the top-N by count so large
+# trees don't get shipped to the WebUI on every poll; the in-memory table
+# still holds up to MAX_TRACKED_NAMES for search to work against.
+TOP_NAMES_LIMIT = 200
+
+_QUERY_LOG_RE = re.compile(
+    r"query:\s+\S+\s+(?P<name>\S+?)\.?\s+(?P<type>\w+)\s+IN"
+)
 
 
 class UnboundManager:
@@ -19,6 +38,14 @@ class UnboundManager:
         self.forwarders_path = os.path.join(
             os.path.dirname(self.conf_path), "lm-forwarders.conf")
         os.makedirs(os.path.dirname(self.conf_path), exist_ok=True)
+
+        # Per-(name,type) query counters fed by _tail_query_log(). Keyed by
+        # "name|TYPE" -> count. self._query_log_offset is the byte offset we
+        # last read up to, so repeated get_stats() polls only parse newly
+        # appended lines instead of re-reading the whole log each time.
+        self._query_counts = {}       # "name|TYPE" -> int
+        self._query_log_offset = 0
+        self._query_log_inode = None
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -246,7 +273,97 @@ class UnboundManager:
 
     # ── Statistics & forwarders ───────────────────────────────────────
 
-    def get_stats(self) -> dict:
+    def _ensure_query_logging(self) -> bool:
+        """Self-enable Unbound query logging on first use.
+
+        ``unbound-control stats`` has no per-name counters, so per-destination
+        breakdowns require Unbound's own query log. Rather than hand-edit the
+        main unbound.conf, drop a managed conf.d snippet (same pattern as
+        LM_CONF) enabling ``log-queries``. Returns True if logging is already
+        (or now) enabled, False if we had to change the conf (caller should
+        reload before the new lines start appearing).
+        """
+        want = f'server:\n    log-queries: yes\n    logfile: "{QUERY_LOG}"\n'
+        try:
+            os.makedirs(os.path.dirname(QUERY_LOG), exist_ok=True)
+        except Exception as e:
+            logger.warning("could not create unbound log dir: %s", e)
+        try:
+            current = open(LOGGING_CONF).read() if os.path.exists(LOGGING_CONF) else ""
+        except Exception:
+            current = ""
+        if current == want:
+            return True
+        try:
+            with open(LOGGING_CONF, "w") as f:
+                f.write(want)
+            logger.info("Enabled unbound query logging via %s", LOGGING_CONF)
+        except Exception as e:
+            logger.warning("failed to write %s: %s", LOGGING_CONF, e)
+            return False
+        return False
+
+    def _tail_query_log(self) -> None:
+        """Incrementally parse newly-appended lines of the unbound query log
+        into ``self._query_counts``, tracking a byte offset so repeated
+        get_stats() calls don't re-read the whole file.
+
+        Handles log rotation: if the file's inode changed (or it shrank),
+        treat it as a fresh file and restart from offset 0.
+        """
+        try:
+            st = os.stat(QUERY_LOG)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            logger.debug("stat query log failed: %s", e)
+            return
+
+        if self._query_log_inode is not None and st.st_ino != self._query_log_inode:
+            self._query_log_offset = 0  # rotated
+        self._query_log_inode = st.st_ino
+        if st.st_size < self._query_log_offset:
+            self._query_log_offset = 0  # truncated/rotated in place
+
+        try:
+            with open(QUERY_LOG, "r", errors="replace") as f:
+                f.seek(self._query_log_offset)
+                for line in f:
+                    m = _QUERY_LOG_RE.search(line)
+                    if not m:
+                        continue
+                    name = m.group("name").lower()
+                    rtype = m.group("type").upper()
+                    key = f"{name}|{rtype}"
+                    if key not in self._query_counts and len(self._query_counts) >= MAX_TRACKED_NAMES:
+                        continue  # cap reached; keep counting names already tracked
+                    self._query_counts[key] = self._query_counts.get(key, 0) + 1
+                self._query_log_offset = f.tell()
+        except Exception as e:
+            logger.warning("failed tailing unbound query log: %s", e)
+
+    def get_query_names(self, search: str = None, limit: int = TOP_NAMES_LIMIT) -> list:
+        """Per-(name,type) query counters, sorted by count desc.
+
+        ``search`` is a case-insensitive substring match against the queried
+        name. ``limit`` truncates the *returned* list only — the full counter
+        table (up to MAX_TRACKED_NAMES distinct name/type pairs) is retained
+        in memory so repeated/narrower searches don't lose data.
+        """
+        self._tail_query_log()
+        needle = (search or "").strip().lower()
+        rows = []
+        for key, count in self._query_counts.items():
+            name, _, rtype = key.rpartition("|")
+            if needle and needle not in name:
+                continue
+            rows.append({"name": name, "type": rtype, "count": count})
+        rows.sort(key=lambda r: r["count"], reverse=True)
+        if limit:
+            rows = rows[:limit]
+        return rows
+
+    def get_stats(self, search: str = None) -> dict:
         """Unbound query statistics via ``unbound-control stats_noreset``.
 
         Parses the flat ``key=value`` output into headline metrics (total
@@ -254,7 +371,15 @@ class UnboundManager:
         per-record-type query breakdown for the UI — the DNS analog of the
         OPNsense resolver stats. ``stats_noreset`` leaves Unbound's counters
         intact so repeated polls don't zero them.
+
+        Also enables (on first call) and tails Unbound's query log to build a
+        per-destination-name breakdown, since stats_noreset has no per-name
+        counters. ``search`` filters that breakdown by substring match on the
+        queried name (see ``get_query_names`` / ``_tail_query_log``).
         """
+        if not self._ensure_query_logging():
+            self._reload()  # newly-written logging conf needs a reload to take effect
+        query_names = self.get_query_names(search=search)
         try:
             result = subprocess.run(
                 ["unbound-control", "stats_noreset"],
@@ -311,6 +436,8 @@ class UnboundManager:
                 "uptime_seconds":    int(n("time.up")),
             },
             "query_types": query_types,
+            "query_names": query_names,
+            "query_names_tracked": len(self._query_counts),
         }
 
     def list_forwarders(self) -> dict:
