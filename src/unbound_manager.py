@@ -16,6 +16,8 @@ UNBOUND_CONF_DIR = "/etc/unbound/conf.d"
 class UnboundManager:
     def __init__(self, conf_path: str = LM_CONF):
         self.conf_path = conf_path
+        self.forwarders_path = os.path.join(
+            os.path.dirname(self.conf_path), "lm-forwarders.conf")
         os.makedirs(os.path.dirname(self.conf_path), exist_ok=True)
 
     # ── Public API ────────────────────────────────────────────────────
@@ -56,9 +58,23 @@ class UnboundManager:
         with open(self.conf_path, "w") as f:
             f.writelines(lines)
 
-        self._reload()
+        # A write that Unbound never reloaded has NOT taken effect: the file on
+        # disk says one thing and the running resolver answers another. Report
+        # the reload failure instead of a SUCCESS the caller cannot act on —
+        # the clustered coordinator relies on this to avoid recording a version
+        # a resolver is not actually serving.
+        reload_result = self._reload()
+        if not reload_result["ok"]:
+            logger.error("Wrote %d DNS records but unbound-control reload failed: %s",
+                         count, reload_result["error"])
+            return {"status": "ERROR", "records_written": count,
+                    "reloaded": False, "error": reload_result["error"],
+                    "message": (f"{count} record(s) written to {self.conf_path} but "
+                                f"unbound-control reload failed: "
+                                f"{reload_result['error']} — the running resolver "
+                                f"is still serving the previous set")}
         logger.info("Synced %d DNS records to Unbound", count)
-        return {"status": "SUCCESS", "records_written": count}
+        return {"status": "SUCCESS", "records_written": count, "reloaded": True}
 
     def list_records(self) -> list:
         """Parse the managed conf file and return records.
@@ -318,6 +334,127 @@ class UnboundManager:
                 })
         return {"status": "SUCCESS", "forwarders": forwarders}
 
+    @staticmethod
+    def _normalize_forward_zone(zone: str) -> str:
+        zone = str(zone or "").strip().lower()
+        if zone == ".":
+            return zone
+        zone = zone.rstrip(".")
+        if not zone or len(zone) > 253:
+            raise ValueError("zone must be '.' or a valid DNS domain")
+        labels = zone.split(".")
+        if any(not re.fullmatch(r"(?!-)[a-z0-9-]{1,63}(?<!-)", label)
+               for label in labels):
+            raise ValueError("zone must be '.' or a valid DNS domain")
+        return zone + "."
+
+    @staticmethod
+    def _normalize_upstreams(upstreams) -> list:
+        if isinstance(upstreams, str):
+            upstreams = re.split(r"[\s,]+", upstreams.strip())
+        values = []
+        for raw in upstreams or []:
+            raw = str(raw).strip()
+            if not raw:
+                continue
+            try:
+                values.append(str(ipaddress.ip_address(raw)))
+            except ValueError as exc:
+                raise ValueError(f"invalid forwarder address: {raw}") from exc
+        if not values:
+            raise ValueError("at least one forwarder address is required")
+        if len(values) > 8:
+            raise ValueError("no more than 8 forwarder addresses are allowed")
+        return list(dict.fromkeys(values))
+
+    def _managed_forwarders(self) -> list:
+        if not os.path.exists(self.forwarders_path):
+            return []
+        forwarders = []
+        current = None
+        with open(self.forwarders_path, encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                match = re.match(r'name:\s*"([^"]+)"$', line)
+                if match:
+                    current = {"zone": match.group(1), "upstreams": []}
+                    forwarders.append(current)
+                    continue
+                match = re.match(r"forward-addr:\s*(\S+)$", line)
+                if match and current is not None:
+                    current["upstreams"].append(match.group(1))
+        return forwarders
+
+    def _write_forwarders(self, forwarders: list) -> dict:
+        old = None
+        if os.path.exists(self.forwarders_path):
+            with open(self.forwarders_path, "rb") as fh:
+                old = fh.read()
+        tmp_path = self.forwarders_path + ".tmp"
+        lines = ["# Managed by Lab Manager — do not edit manually\n"]
+        for item in forwarders:
+            lines.extend([
+                "forward-zone:\n",
+                f'    name: "{item["zone"]}"\n',
+                *[f"    forward-addr: {address}\n"
+                  for address in item["upstreams"]],
+            ])
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                fh.writelines(lines)
+            os.replace(tmp_path, self.forwarders_path)
+            result = self._reload()
+            if result["ok"]:
+                return {"status": "SUCCESS", "reloaded": True}
+            if old is None:
+                os.remove(self.forwarders_path)
+            else:
+                with open(self.forwarders_path, "wb") as fh:
+                    fh.write(old)
+            self._reload()
+            return {"status": "ERROR", "reloaded": False,
+                    "message": result["error"]}
+        except Exception as exc:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            return {"status": "ERROR", "reloaded": False,
+                    "message": str(exc)}
+
+    def add_forwarder(self, zone: str, upstreams) -> dict:
+        try:
+            zone = self._normalize_forward_zone(zone)
+            upstreams = self._normalize_upstreams(upstreams)
+        except ValueError as exc:
+            return {"status": "ERROR", "message": str(exc), "changed": False}
+        live = self.list_forwarders()
+        if live.get("status") != "SUCCESS":
+            return {**live, "changed": False}
+        if any(self._normalize_forward_zone(item.get("zone")) == zone
+               for item in live.get("forwarders") or []):
+            return {"status": "ERROR",
+                    "message": f"forwarder zone {zone} already exists",
+                    "changed": False}
+        result = self._write_forwarders([
+            *self._managed_forwarders(),
+            {"zone": zone, "upstreams": upstreams},
+        ])
+        return {**result, "zone": zone, "upstreams": upstreams,
+                "changed": result.get("status") == "SUCCESS"}
+
+    def remove_forwarder(self, zone: str) -> dict:
+        """Remove an LM-managed forwarding zone. Used for cluster rollback."""
+        try:
+            zone = self._normalize_forward_zone(zone)
+        except ValueError as exc:
+            return {"status": "ERROR", "message": str(exc)}
+        existing = self._managed_forwarders()
+        kept = [item for item in existing if item.get("zone") != zone]
+        if len(kept) == len(existing):
+            return {"status": "SUCCESS", "changed": False, "zone": zone}
+        result = self._write_forwarders(kept)
+        return {**result, "changed": result.get("status") == "SUCCESS",
+                "zone": zone}
+
     # ── Helpers ───────────────────────────────────────────────────────
 
     @staticmethod
@@ -393,12 +530,19 @@ class UnboundManager:
         finally:
             sock.close()
 
-    def _reload(self):
+    def _reload(self) -> dict:
+        """Reload Unbound. Returns ``{"ok": bool, "error": str}``.
+
+        Previously swallowed the failure with a WARNING, so a conf write whose
+        reload never happened still reported SUCCESS upstream. Callers need the
+        distinction: the file changed but the resolver did not."""
         try:
             subprocess.run(["unbound-control", "reload"], check=True, timeout=10)
             logger.info("Unbound reloaded")
+            return {"ok": True, "error": ""}
         except Exception as e:
             logger.warning("unbound-control reload failed: %s", e)
+            return {"ok": False, "error": str(e)}
 
     def _ptr_name(self, ip: str) -> str:
         try:
