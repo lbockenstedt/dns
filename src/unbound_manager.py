@@ -284,11 +284,19 @@ class UnboundManager:
         total  = n("total.num.queries")
         hit_ratio = round(hits / total * 100, 1) if total else 0.0
 
-        query_types = {}
+        aggregate_types = {}
+        threaded_types = {}
         for k, v in raw.items():
-            m = re.match(r"num\.query\.type\.(\w+)$", k)
+            m = re.match(r"(?:total\.)?num\.query\.type\.([A-Za-z0-9_-]+)$", k)
             if m and isinstance(v, (int, float)) and v:
-                query_types[m.group(1)] = int(v)
+                aggregate_types[m.group(1)] = int(v)
+                continue
+            m = re.match(
+                r"thread\d+\.num\.query\.type\.([A-Za-z0-9_-]+)$", k)
+            if m and isinstance(v, (int, float)) and v:
+                threaded_types[m.group(1)] = (
+                    threaded_types.get(m.group(1), 0) + int(v))
+        query_types = aggregate_types or threaded_types
 
         return {
             "status": "SUCCESS",
