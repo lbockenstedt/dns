@@ -13,7 +13,7 @@ The `dns` role is management-only and does not install, start, or invoke a local
 
 ## What it does
 
-The `dns` module manages DNS records across one or more **Unbound** resolver workers and shows their query statistics and configured upstream forwarders. Records are simple name/type/value entries (A/AAAA get an automatic PTR companion; CNAME and PTR are also supported) — add one by hand, or let it fill in automatically from NetBox. Global Admins can add persistent per-zone forwarders from the **Forwarders** tab; the change is applied to every resolver worker.
+The `dns` module manages DNS records across one or more **Unbound** resolver workers and shows their query statistics and configured upstream forwarders. DNS Server installation enables Unbound extended statistics so the Statistics tab includes the per-query-type A/AAAA/PTR/etc. breakdown; the parser supports aggregate and per-thread Unbound counter formats. Records are simple name/type/value entries (A/AAAA get an automatic PTR companion; CNAME and PTR are also supported) — add one by hand, or let it fill in automatically from NetBox. Global Admins can add persistent per-zone forwarders from the **Forwarders** tab; the change is applied to every resolver worker.
 
 In the WebUI, open a node's **DNS** module from the sidebar to reach the **Records**, **Statistics**, **Diagnostics**, and **Forwarders** tabs — see the [WebUI](#webui) section below for what each tab shows.
 
