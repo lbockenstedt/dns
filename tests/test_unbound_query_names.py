@@ -144,6 +144,11 @@ def test_ensure_query_logging_writes_conf_once(tmp_path, monkeypatch, mgr):
     content = open(um_mod.LOGGING_CONF).read()
     assert "log-queries: yes" in content
     assert um_mod.QUERY_LOG in content
+    # Regression: Unbound defaults use-syslog: yes, which makes it IGNORE the
+    # logfile directive entirely — without this line the query log file is
+    # never written and get_query_names()/get_stats() destination breakdown
+    # stays permanently empty.
+    assert "use-syslog: no" in content
 
     second = mgr._ensure_query_logging()
     assert second is True  # already matches -> no rewrite needed
