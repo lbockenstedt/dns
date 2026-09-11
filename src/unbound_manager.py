@@ -291,7 +291,13 @@ class UnboundManager:
         (or now) enabled, False if we had to change the conf (caller should
         reload before the new lines start appearing).
         """
-        want = f'server:\n    log-queries: yes\n    logfile: "{QUERY_LOG}"\n'
+        # Unbound defaults to use-syslog: yes, which makes it IGNORE the
+        # logfile directive entirely (see log_init() — syslog wins over a
+        # configured filename) — without disabling it here, log-queries/
+        # logfile above silently write nothing and get_query_names() stays
+        # permanently empty even though this snippet "looks" correct.
+        want = (f'server:\n    log-queries: yes\n'
+                f'    use-syslog: no\n    logfile: "{QUERY_LOG}"\n')
         try:
             os.makedirs(os.path.dirname(QUERY_LOG), exist_ok=True)
         except Exception as e:
