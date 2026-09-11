@@ -121,7 +121,8 @@ class FakeTransport:
                 results[m] = {"status": "SUCCESS",
                               "global": {"total_queries": 10, "cache_hits": 5},
                               "query_types": {"A": 10},
-                              "query_names": [{"name": "www.dwx.com", "type": "A", "count": 4}]}
+                              "query_names": [{"name": "www.dwx.com", "type": "A", "count": 4,
+                                                "sources": [{"ip": "172.17.1.5", "count": 4}]}]}
             else:
                 results[m] = {"status": "SUCCESS"}
         ok = [member for member, result in results.items()
@@ -240,10 +241,19 @@ def test_clustered_stats_are_summed_across_members(tmp_path):
 def test_clustered_stats_merge_query_names_across_members(tmp_path):
     """Both cluster members answer with the same www.dwx.com/A counter (they
     serve the same desired record set) — the coordinator should sum them,
-    not report one member's count or duplicate rows."""
+    not report one member's count or duplicate rows. Per-source counts are
+    summed the same way."""
     spoke = _spoke(tmp_path, ["dns-a", "dns-b"])
     out = _run(spoke.handle_command("DNS_STATS", {}))
-    assert out["query_names"] == [{"name": "www.dwx.com", "type": "A", "count": 8}]
+    assert out["query_names"] == [{"name": "www.dwx.com", "type": "A", "count": 8,
+                                    "sources": [{"ip": "172.17.1.5", "count": 8}]}]
+
+
+def test_clustered_stats_source_prefixes_is_forwarded_to_each_member(tmp_path):
+    spoke = _spoke(tmp_path, ["dns-a", "dns-b"])
+    _run(spoke.handle_command("DNS_STATS", {"source_prefixes": ["172.17.1.0/24"]}))
+    stats_calls = [c for c in spoke._transport.sent if c[0] == "DNSW_STATS"]
+    assert stats_calls and stats_calls[0][1] == {"source_prefixes": ["172.17.1.0/24"]}
 
 
 def test_clustered_stats_search_is_forwarded_to_each_member(tmp_path):
