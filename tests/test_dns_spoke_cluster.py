@@ -120,7 +120,9 @@ class FakeTransport:
             elif command == "DNSW_STATS":
                 results[m] = {"status": "SUCCESS",
                               "global": {"total_queries": 10, "cache_hits": 5},
-                              "query_types": {"A": 10}}
+                              "query_types": {"A": 10},
+                              "query_names": [{"name": "www.dwx.com", "type": "A", "count": 4,
+                                                "sources": [{"ip": "172.17.1.5", "count": 4}]}]}
             else:
                 results[m] = {"status": "SUCCESS"}
         ok = [member for member, result in results.items()
@@ -234,6 +236,31 @@ def test_clustered_stats_are_summed_across_members(tmp_path):
     out = _run(spoke.handle_command("DNS_STATS", {}))
     assert out["global"]["total_queries"] == 20
     assert out["query_types"] == {"A": 20}
+
+
+def test_clustered_stats_merge_query_names_across_members(tmp_path):
+    """Both cluster members answer with the same www.dwx.com/A counter (they
+    serve the same desired record set) — the coordinator should sum them,
+    not report one member's count or duplicate rows. Per-source counts are
+    summed the same way."""
+    spoke = _spoke(tmp_path, ["dns-a", "dns-b"])
+    out = _run(spoke.handle_command("DNS_STATS", {}))
+    assert out["query_names"] == [{"name": "www.dwx.com", "type": "A", "count": 8,
+                                    "sources": [{"ip": "172.17.1.5", "count": 8}]}]
+
+
+def test_clustered_stats_source_prefixes_is_forwarded_to_each_member(tmp_path):
+    spoke = _spoke(tmp_path, ["dns-a", "dns-b"])
+    _run(spoke.handle_command("DNS_STATS", {"source_prefixes": ["172.17.1.0/24"]}))
+    stats_calls = [c for c in spoke._transport.sent if c[0] == "DNSW_STATS"]
+    assert stats_calls and stats_calls[0][1] == {"source_prefixes": ["172.17.1.0/24"]}
+
+
+def test_clustered_stats_search_is_forwarded_to_each_member(tmp_path):
+    spoke = _spoke(tmp_path, ["dns-a", "dns-b"])
+    _run(spoke.handle_command("DNS_STATS", {"search": "dwx"}))
+    stats_calls = [c for c in spoke._transport.sent if c[0] == "DNSW_STATS"]
+    assert stats_calls and stats_calls[0][1] == {"search": "dwx"}
 
 
 def test_clustered_telemetry_is_degraded_until_converged(tmp_path):
