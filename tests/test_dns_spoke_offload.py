@@ -66,8 +66,8 @@ class FakeMgr:
         self._tid()
         return {"running": True, "record_count": 3, "conf_path": "/etc/unbound/conf.d/lm-netbox.conf"}
 
-    def get_stats(self, search=None):
-        self.calls.append(("get_stats", search))
+    def get_stats(self, search=None, source_prefixes=None):
+        self.calls.append(("get_stats", search, source_prefixes))
         self._tid()
         return {"status": "SUCCESS", "global": {"total_queries": 10}}
 

@@ -60,7 +60,7 @@ class FakeMgr:
     def diagnostics(self):
         return {"status": "SUCCESS", "healthy": True, "recommendations": []}
 
-    def get_stats(self):
+    def get_stats(self, search=None, source_prefixes=None):
         return {"status": "SUCCESS", "global": {"total_queries": 3},
                 "query_types": {"A": 3}}
 

@@ -27,8 +27,13 @@ MAX_TRACKED_NAMES = 5000
 # still holds up to MAX_TRACKED_NAMES for search to work against.
 TOP_NAMES_LIMIT = 200
 
+# Unbound's actual `log-queries: yes` line (util/net_help.c:log_query_in) is
+# emitted via log_info as "<prefix...> <client_ip> <qname> <type> <class>",
+# e.g. "[time] unbound[pid:0] info: 172.17.1.5 www.dwx.com. A IN". The client
+# IP is the token immediately before the (dotted) qname, and IN is the fixed
+# class Unbound logs for normal queries.
 _QUERY_LOG_RE = re.compile(
-    r"query:\s+\S+\s+(?P<name>\S+?)\.?\s+(?P<type>\w+)\s+IN"
+    r"info:\s+(?P<ip>[0-9a-fA-F.:]+)\s+(?P<name>\S+?)\.?\s+(?P<type>\w+)\s+IN\s*$"
 )
 
 
@@ -39,11 +44,14 @@ class UnboundManager:
             os.path.dirname(self.conf_path), "lm-forwarders.conf")
         os.makedirs(os.path.dirname(self.conf_path), exist_ok=True)
 
-        # Per-(name,type) query counters fed by _tail_query_log(). Keyed by
-        # "name|TYPE" -> count. self._query_log_offset is the byte offset we
-        # last read up to, so repeated get_stats() polls only parse newly
-        # appended lines instead of re-reading the whole log each time.
-        self._query_counts = {}       # "name|TYPE" -> int
+        # Per-(name,type,source-ip) query counters fed by _tail_query_log().
+        # Keyed by "name|TYPE|source_ip" -> count so the per-destination
+        # breakdown can also report WHICH client(s) asked for it (needed for
+        # per-tenant filtering upstream, keyed on the source IP's subnet).
+        # self._query_log_offset is the byte offset we last read up to, so
+        # repeated get_stats() polls only parse newly appended lines instead
+        # of re-reading the whole log each time.
+        self._query_counts = {}       # "name|TYPE|source_ip" -> int
         self._query_log_offset = 0
         self._query_log_inode = None
 
@@ -334,7 +342,8 @@ class UnboundManager:
                         continue
                     name = m.group("name").lower()
                     rtype = m.group("type").upper()
-                    key = f"{name}|{rtype}"
+                    ip = m.group("ip")
+                    key = f"{name}|{rtype}|{ip}"
                     if key not in self._query_counts and len(self._query_counts) >= MAX_TRACKED_NAMES:
                         continue  # cap reached; keep counting names already tracked
                     self._query_counts[key] = self._query_counts.get(key, 0) + 1
@@ -342,28 +351,61 @@ class UnboundManager:
         except Exception as e:
             logger.warning("failed tailing unbound query log: %s", e)
 
-    def get_query_names(self, search: str = None, limit: int = TOP_NAMES_LIMIT) -> list:
-        """Per-(name,type) query counters, sorted by count desc.
+    def get_query_names(self, search: str = None, limit: int = TOP_NAMES_LIMIT,
+                         source_prefixes: list = None) -> list:
+        """Per-(name,type) query counters, sorted by count desc, each carrying
+        its breakdown of source client IPs.
 
         ``search`` is a case-insensitive substring match against the queried
-        name. ``limit`` truncates the *returned* list only — the full counter
-        table (up to MAX_TRACKED_NAMES distinct name/type pairs) is retained
-        in memory so repeated/narrower searches don't lose data.
+        name. ``source_prefixes`` (a list of ``ipaddress.ip_network``-parsable
+        CIDR strings), when given, scopes both which rows are returned AND
+        their counts to only the sources that fall inside those prefixes —
+        this is how a tenant's DNS statistics view is restricted to queries
+        made by their own devices (mirrors the subnet-based tenant filtering
+        used elsewhere, e.g. ``access.filter_items_by_prefixes``). ``limit``
+        truncates the *returned* list only — the full counter table (up to
+        MAX_TRACKED_NAMES distinct name/type/source entries) is retained in
+        memory so repeated/narrower searches don't lose data.
         """
         self._tail_query_log()
         needle = (search or "").strip().lower()
-        rows = []
+        nets = None
+        if source_prefixes is not None:
+            nets = []
+            for p in source_prefixes:
+                try:
+                    nets.append(ipaddress.ip_network(p, strict=False))
+                except ValueError:
+                    continue
+        grouped = {}  # "name|TYPE" -> {"name":, "type":, "count":, "sources": {ip: count}}
         for key, count in self._query_counts.items():
-            name, _, rtype = key.rpartition("|")
+            name, rtype, ip = key.split("|", 2)
             if needle and needle not in name:
                 continue
-            rows.append({"name": name, "type": rtype, "count": count})
+            if nets is not None:
+                try:
+                    addr = ipaddress.ip_address(ip)
+                except ValueError:
+                    continue
+                if not any(addr in n for n in nets):
+                    continue  # source outside this tenant's subnets
+            gkey = f"{name}|{rtype}"
+            g = grouped.setdefault(gkey, {"name": name, "type": rtype, "count": 0, "sources": {}})
+            g["count"] += count
+            g["sources"][ip] = g["sources"].get(ip, 0) + count
+        rows = []
+        for g in grouped.values():
+            sources = sorted(
+                ({"ip": ip, "count": c} for ip, c in g["sources"].items()),
+                key=lambda s: s["count"], reverse=True,
+            )
+            rows.append({"name": g["name"], "type": g["type"], "count": g["count"], "sources": sources})
         rows.sort(key=lambda r: r["count"], reverse=True)
         if limit:
             rows = rows[:limit]
         return rows
 
-    def get_stats(self, search: str = None) -> dict:
+    def get_stats(self, search: str = None, source_prefixes: list = None) -> dict:
         """Unbound query statistics via ``unbound-control stats_noreset``.
 
         Parses the flat ``key=value`` output into headline metrics (total
@@ -373,13 +415,15 @@ class UnboundManager:
         intact so repeated polls don't zero them.
 
         Also enables (on first call) and tails Unbound's query log to build a
-        per-destination-name breakdown, since stats_noreset has no per-name
-        counters. ``search`` filters that breakdown by substring match on the
-        queried name (see ``get_query_names`` / ``_tail_query_log``).
+        per-destination-name breakdown (each with its querying source IPs),
+        since stats_noreset has no per-name counters. ``search`` filters that
+        breakdown by substring match on the queried name; ``source_prefixes``
+        scopes it to only queries whose source IP falls in those CIDRs (used
+        for per-tenant filtering — see ``get_query_names``).
         """
         if not self._ensure_query_logging():
             self._reload()  # newly-written logging conf needs a reload to take effect
-        query_names = self.get_query_names(search=search)
+        query_names = self.get_query_names(search=search, source_prefixes=source_prefixes)
         try:
             result = subprocess.run(
                 ["unbound-control", "stats_noreset"],

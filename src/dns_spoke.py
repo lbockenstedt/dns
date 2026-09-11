@@ -403,9 +403,14 @@ class DNSSpoke(BaseSpoke):
             "recommendations": recommendations,
         }
 
-    async def _cluster_stats(self, search: str = None) -> Dict[str, Any]:
+    async def _cluster_stats(self, search: str = None, source_prefixes: list = None) -> Dict[str, Any]:
         """Cluster stats: per-member counters plus the summed headline totals."""
-        fan = await self._transport.fanout("DNSW_STATS", {"search": search} if search else {}, timeout=20.0)
+        payload = {}
+        if search:
+            payload["search"] = search
+        if source_prefixes:
+            payload["source_prefixes"] = source_prefixes
+        fan = await self._transport.fanout("DNSW_STATS", payload, timeout=20.0)
         per_member: Dict[str, Any] = {}
         totals = {"total_queries": 0, "cache_hits": 0, "cache_misses": 0,
                   "num_recursive": 0, "prefetch": 0}
@@ -423,17 +428,27 @@ class DNSSpoke(BaseSpoke):
         # query_names is merged across members by (name, type): different
         # resolvers in the same cluster serve the same desired record set, so
         # a name queried against multiple members should show a combined
-        # count rather than one arbitrary member's view.
-        merged_names: Dict[tuple, int] = {}
+        # count rather than one arbitrary member's view. Per-source counts are
+        # merged the same way so the "who queried this" breakdown stays
+        # accurate across the cluster.
+        merged_names: Dict[tuple, dict] = {}
         for reply in per_member.values():
             if isinstance(reply, dict) and reply.get("status") == "SUCCESS":
                 for qtype, count in (reply.get("query_types") or {}).items():
                     merged_types[qtype] = merged_types.get(qtype, 0) + int(count or 0)
                 for entry in reply.get("query_names") or []:
                     key = (entry.get("name"), entry.get("type"))
-                    merged_names[key] = merged_names.get(key, 0) + int(entry.get("count") or 0)
+                    g = merged_names.setdefault(key, {"count": 0, "sources": {}})
+                    g["count"] += int(entry.get("count") or 0)
+                    for s in entry.get("sources") or []:
+                        ip = s.get("ip")
+                        g["sources"][ip] = g["sources"].get(ip, 0) + int(s.get("count") or 0)
         query_names = sorted(
-            ({"name": n, "type": t, "count": c} for (n, t), c in merged_names.items()),
+            ({"name": n, "type": t, "count": g["count"],
+              "sources": sorted(
+                  ({"ip": ip, "count": c} for ip, c in g["sources"].items()),
+                  key=lambda s: s["count"], reverse=True)}
+             for (n, t), g in merged_names.items()),
             key=lambda r: r["count"], reverse=True,
         )
         return {"status": "SUCCESS", "global": totals, "query_types": merged_types,
@@ -566,7 +581,8 @@ class DNSSpoke(BaseSpoke):
             if cmd == "DNS_DIAGNOSTICS":
                 return await self._cluster_diagnostics()
             if cmd == "DNS_STATS":
-                return await self._cluster_stats(search=data.get("search"))
+                return await self._cluster_stats(search=data.get("search"),
+                                                 source_prefixes=data.get("source_prefixes"))
             if cmd == "DNS_FORWARDERS":
                 return await self._cluster_forwarders()
             if cmd == "DNS_FORWARDER_ADD":
@@ -621,7 +637,8 @@ class DNSSpoke(BaseSpoke):
 
         if cmd == "DNS_STATS":
             search = data.get("search")
-            return await asyncio.to_thread(self.mgr.get_stats, search)
+            source_prefixes = data.get("source_prefixes")
+            return await asyncio.to_thread(self.mgr.get_stats, search, source_prefixes)
 
         if cmd == "DNS_FORWARDERS":
             return await asyncio.to_thread(self.mgr.list_forwarders)
