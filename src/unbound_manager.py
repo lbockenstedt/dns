@@ -12,6 +12,11 @@ logger = logging.getLogger("UnboundManager")
 LM_CONF = "/etc/unbound/conf.d/lm-netbox.conf"
 UNBOUND_CONF_DIR = "/etc/unbound/conf.d"
 LOGGING_CONF = "/etc/unbound/conf.d/lm-logging.conf"
+# Unbound's main config. We never edit it in place; we only read it to learn
+# which directory it actually parses, and bridge our own dir into that.
+MAIN_CONF = "/etc/unbound/unbound.conf"
+# Name of the one-line bridge file we drop into the distro's included dir.
+BRIDGE_CONF_NAME = "lm-include.conf"
 QUERY_LOG = "/var/log/unbound/lm-queries.log"
 
 # unbound-control's stats_noreset is aggregate-only (per-type/rcode/etc.) and
@@ -43,6 +48,7 @@ class UnboundManager:
         self.forwarders_path = os.path.join(
             os.path.dirname(self.conf_path), "lm-forwarders.conf")
         os.makedirs(os.path.dirname(self.conf_path), exist_ok=True)
+        self._ensure_conf_included()
 
         # Per-(name,type,source-ip) query counters fed by _tail_query_log().
         # Keyed by "name|TYPE|source_ip" -> count so the per-destination
@@ -54,6 +60,84 @@ class UnboundManager:
         self._query_counts = {}       # "name|TYPE|source_ip" -> int
         self._query_log_offset = 0
         self._query_log_inode = None
+
+    def _ensure_conf_included(self) -> dict:
+        """Guarantee Unbound actually PARSES the directory we write into.
+
+        We write every managed file (records, forwarders, query logging) to
+        ``/etc/unbound/conf.d/``. Debian/Ubuntu's packaged ``unbound.conf``
+        includes ``/etc/unbound/unbound.conf.d/*.conf`` — a DIFFERENT directory
+        (note the ``unbound.`` prefix). On a host where nothing else bridges the
+        two, every file we write is silently ignored: ``sync()`` reports
+        SUCCESS and ``unbound-control reload`` succeeds, because both are
+        truthfully describing a write and a reload of a config Unbound never
+        reads. The resolver then answers recursively for public names while
+        every lab record and forwarder is missing — which presents as "DNS is
+        broken" with a completely healthy-looking service and a clean sync.
+
+        Rather than edit the packaged ``unbound.conf`` (an apt upgrade would
+        revert it, and rewriting a distro file is a poor neighbour), drop a
+        one-line bridge file into whichever directory Unbound already includes.
+        ``include-toplevel`` is the correct directive: our files declare their
+        own top-level clauses (``server:``, ``forward-zone:``).
+
+        Idempotent and best-effort — never raises, so a read-only or unusual
+        layout degrades to today's behaviour instead of breaking startup.
+        """
+        conf_dir = os.path.dirname(self.conf_path)
+        try:
+            with open(MAIN_CONF) as fh:
+                main_text = fh.read()
+        except OSError as e:
+            logger.debug("unbound include check: cannot read %s: %s", MAIN_CONF, e)
+            return {"ok": False, "reason": "main conf unreadable"}
+
+        include_globs = re.findall(
+            r'^\s*include(?:-toplevel)?:\s*"?([^"\s]+)"?', main_text, re.M)
+
+        def _covers(glob_path):
+            """True if this glob pulls in *.conf from our directory."""
+            return os.path.dirname(glob_path.rstrip()) == conf_dir.rstrip("/")
+
+        if any(_covers(g) for g in include_globs):
+            return {"ok": True, "action": "already-included"}
+
+        # Follow the distro's own include dir(s) and check whether a bridge is
+        # already in place there (ours from a previous run, or an operator's).
+        bridge_dirs = [os.path.dirname(g) for g in include_globs
+                       if os.path.isdir(os.path.dirname(g))]
+        for d in bridge_dirs:
+            try:
+                for name in os.listdir(d):
+                    if not name.endswith(".conf"):
+                        continue
+                    with open(os.path.join(d, name)) as fh:
+                        if any(_covers(g) for g in re.findall(
+                                r'^\s*include(?:-toplevel)?:\s*"?([^"\s]+)"?',
+                                fh.read(), re.M)):
+                            return {"ok": True, "action": "already-bridged"}
+            except OSError:
+                continue
+
+        if not bridge_dirs:
+            logger.warning(
+                "unbound: %s includes no directory we can bridge into; managed "
+                "config in %s may not be loaded", MAIN_CONF, conf_dir)
+            return {"ok": False, "reason": "no include dir"}
+
+        bridge = os.path.join(bridge_dirs[0], BRIDGE_CONF_NAME)
+        try:
+            with open(bridge, "w") as fh:
+                fh.write("# Managed by Lab Manager — do not edit manually\n"
+                         "# Bridges LM's managed config dir into Unbound, which\n"
+                         "# otherwise only parses this directory.\n"
+                         'include-toplevel: "%s/*.conf"\n' % conf_dir.rstrip("/"))
+        except OSError as e:
+            logger.warning("unbound: could not write include bridge %s: %s", bridge, e)
+            return {"ok": False, "reason": str(e)}
+        logger.warning("unbound: wrote include bridge %s so %s is actually parsed",
+                       bridge, conf_dir)
+        return {"ok": True, "action": "bridged", "path": bridge}
 
     # ── Public API ────────────────────────────────────────────────────
 
