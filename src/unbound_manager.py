@@ -654,6 +654,28 @@ class UnboundManager:
                     current["upstreams"].append(match.group(1))
         return forwarders
 
+    @staticmethod
+    def _coalesce_forwarders(forwarders: list) -> list:
+        """One ``forward-zone`` block per zone name.
+
+        Unbound takes a zone's upstreams from a single block, so emitting the
+        same name twice is at best redundant and at worst rejected. The writer
+        used to render one block per list entry, so repeated adds for the same
+        zone (the UI defaults the zone field to ".") piled up duplicate
+        ``forward-zone: name: "."`` stanzas. Merging here also heals a file
+        that already drifted, on the next successful write."""
+        merged: dict = {}
+        for item in forwarders or []:
+            zone = str((item or {}).get("zone") or "").strip()
+            if not zone:
+                continue
+            bucket = merged.setdefault(zone, [])
+            for address in (item or {}).get("upstreams") or []:
+                if address not in bucket:
+                    bucket.append(address)
+        return [{"zone": zone, "upstreams": upstreams}
+                for zone, upstreams in merged.items()]
+
     def _write_forwarders(self, forwarders: list) -> dict:
         old = None
         if os.path.exists(self.forwarders_path):
@@ -661,7 +683,7 @@ class UnboundManager:
                 old = fh.read()
         tmp_path = self.forwarders_path + ".tmp"
         lines = ["# Managed by Lab Manager — do not edit manually\n"]
-        for item in forwarders:
+        for item in self._coalesce_forwarders(forwarders):
             lines.extend([
                 "forward-zone:\n",
                 f'    name: "{item["zone"]}"\n',
@@ -689,25 +711,63 @@ class UnboundManager:
             return {"status": "ERROR", "reloaded": False,
                     "message": str(exc)}
 
+    def _safe_zone(self, zone) -> str:
+        """``_normalize_forward_zone`` that returns "" instead of raising, for
+        zone names we did not write and cannot vouch for."""
+        try:
+            return self._normalize_forward_zone(zone)
+        except ValueError:
+            return ""
+
     def add_forwarder(self, zone: str, upstreams) -> dict:
+        """Point a forwarding zone at one or more upstream resolvers.
+
+        Adding to a zone LM already manages MERGES the new addresses in. It
+        used to fail outright with "forwarder zone X already exists", which
+        made the common case impossible: the UI's zone field defaults to ".",
+        so "add an upstream server" is almost always an add against the
+        already-present root zone. Operators saw only the coordinator's
+        "forwarder was not added to all resolvers".
+
+        A zone Unbound serves from config LM does NOT own is still refused —
+        we cannot merge into a file we do not manage."""
         try:
             zone = self._normalize_forward_zone(zone)
             upstreams = self._normalize_upstreams(upstreams)
         except ValueError as exc:
             return {"status": "ERROR", "message": str(exc), "changed": False}
-        live = self.list_forwarders()
-        if live.get("status") != "SUCCESS":
-            return {**live, "changed": False}
-        if any(self._normalize_forward_zone(item.get("zone")) == zone
-               for item in live.get("forwarders") or []):
-            return {"status": "ERROR",
-                    "message": f"forwarder zone {zone} already exists",
-                    "changed": False}
-        result = self._write_forwarders([
-            *self._managed_forwarders(),
-            {"zone": zone, "upstreams": upstreams},
-        ])
-        return {**result, "zone": zone, "upstreams": upstreams,
+        existing = self._coalesce_forwarders(self._managed_forwarders())
+        current = next((item for item in existing
+                        if self._safe_zone(item.get("zone")) == zone), None)
+        if current is None:
+            live = self.list_forwarders()
+            if live.get("status") != "SUCCESS":
+                return {**live, "changed": False}
+            if any(self._safe_zone(item.get("zone")) == zone
+                   for item in live.get("forwarders") or []):
+                return {"status": "ERROR", "changed": False,
+                        "message": f"forwarder zone {zone} is already served by "
+                                   "Unbound from configuration Lab Manager does "
+                                   "not manage"}
+            merged = [*existing, {"zone": zone, "upstreams": upstreams}]
+            final = upstreams
+        else:
+            known = list(current.get("upstreams") or [])
+            added = [a for a in upstreams if a not in known]
+            if not added:
+                return {"status": "SUCCESS", "changed": False, "zone": zone,
+                        "upstreams": known,
+                        "message": f"forwarder zone {zone} already forwards to "
+                                   + ", ".join(upstreams)}
+            final = known + added
+            if len(final) > 8:
+                return {"status": "ERROR", "changed": False, "zone": zone,
+                        "message": f"forwarder zone {zone} would exceed the "
+                                   "8-address limit"}
+            merged = [{**item, "upstreams": final} if item is current else item
+                      for item in existing]
+        result = self._write_forwarders(merged)
+        return {**result, "zone": zone, "upstreams": final,
                 "changed": result.get("status") == "SUCCESS"}
 
     def remove_forwarder(self, zone: str) -> dict:
