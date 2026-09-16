@@ -497,7 +497,19 @@ class DNSSpoke(BaseSpoke):
                 "DNSW_FORWARDER_REMOVE", {"zone": data.get("zone")},
                 timeout=20.0, member_ids=rollback_ids)
         failed = ", ".join(fan.get("failed") or [])
+        # Without the members' own messages this reads "not added to all
+        # resolvers (<uuid>, <uuid>)" and nothing else, so the actual cause
+        # ("already forwards to ...", a bad address, a reload failure) is only
+        # recoverable by reading each resolver's log by hand.
+        reasons = []
+        for member_id in (fan.get("failed") or []):
+            reason = str(((fan.get("results") or {}).get(member_id)
+                          or {}).get("message") or "").strip()
+            if reason and reason not in reasons:
+                reasons.append(reason)
         message = f"forwarder was not added to all resolvers ({failed})"
+        if reasons:
+            message += ": " + "; ".join(reasons)
         if rollback.get("failed"):
             message += "; rollback also failed on " + ", ".join(rollback["failed"])
         return {"status": "ERROR", "message": message,
