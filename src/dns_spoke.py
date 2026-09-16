@@ -412,18 +412,36 @@ class DNSSpoke(BaseSpoke):
             payload["source_prefixes"] = source_prefixes
         fan = await self._transport.fanout("DNSW_STATS", payload, timeout=20.0)
         per_member: Dict[str, Any] = {}
+        member_errors: Dict[str, str] = {}
         totals = {"total_queries": 0, "cache_hits": 0, "cache_misses": 0,
                   "num_recursive": 0, "prefetch": 0}
+        # recursion_time_avg is an AVERAGE, so it cannot be summed like the
+        # counters above. Summing was not the bug -- it was never carried at
+        # all, so a clustered Statistics page reported "avg 0s" no matter what
+        # either resolver measured. Combine it the only correct way: weight
+        # each member's average by the recursions it actually served.
+        recursion_time_weighted = 0.0
         for member_id, reply in (fan.get("results") or {}).items():
             per_member[member_id] = reply
             if not isinstance(reply, dict) or reply.get("status") != "SUCCESS":
+                member_errors[member_id] = (
+                    (reply.get("message") if isinstance(reply, dict) else None)
+                    or "no response")
                 continue
             g = reply.get("global") or {}
             for key in totals:
                 totals[key] += int(g.get(key) or 0)
+            try:
+                recursion_time_weighted += (float(g.get("recursion_time_avg") or 0.0)
+                                            * int(g.get("num_recursive") or 0))
+            except (TypeError, ValueError):
+                pass
         total = totals["total_queries"]
         totals["cache_hit_ratio"] = (round(totals["cache_hits"] / total * 100, 1)
                                      if total else 0.0)
+        totals["recursion_time_avg"] = (
+            round(recursion_time_weighted / totals["num_recursive"], 4)
+            if totals["num_recursive"] else 0.0)
         merged_types: Dict[str, int] = {}
         # query_names is merged across members by (name, type): different
         # resolvers in the same cluster serve the same desired record set, so
@@ -452,7 +470,13 @@ class DNSSpoke(BaseSpoke):
             key=lambda r: r["count"], reverse=True,
         )
         return {"status": "SUCCESS", "global": totals, "query_types": merged_types,
-                "query_names": query_names, "cluster": True, "members": per_member}
+                "query_names": query_names, "cluster": True, "members": per_member,
+                # Totals are a SUM across resolvers. If one did not answer the
+                # headline numbers silently under-report, so say how many fed
+                # them rather than letting the page look authoritative.
+                "member_count": len(per_member),
+                "members_reporting": len(per_member) - len(member_errors),
+                "member_errors": member_errors}
 
     async def _cluster_forwarders(self) -> Dict[str, Any]:
         """Upstream forwarders per resolver.
