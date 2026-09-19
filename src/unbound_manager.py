@@ -411,9 +411,7 @@ class UnboundManager:
         """
         try:
             st = os.stat(QUERY_LOG)
-            # Log file does not exist yet - Unbound may not be running
-            # or query logging has not been enabled. Return early without
-            # erroring since _ensure_query_logging() will try to enable it.
+        except FileNotFoundError:
             logger.debug("Query log file not found: %s (Unbound may not be running)", QUERY_LOG)
             return
         except Exception as e:
