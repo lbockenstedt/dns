@@ -412,6 +412,7 @@ class UnboundManager:
         try:
             st = os.stat(QUERY_LOG)
         except FileNotFoundError:
+            logger.debug("Query log file not found: %s (Unbound may not be running)", QUERY_LOG)
             return
         except Exception as e:
             logger.debug("stat query log failed: %s", e)
@@ -511,8 +512,11 @@ class UnboundManager:
         scopes it to only queries whose source IP falls in those CIDRs (used
         for per-tenant filtering — see ``get_query_names``).
         """
+        reload_error = None
         if not self._ensure_query_logging():
-            self._reload()  # newly-written logging conf needs a reload to take effect
+            reload_result = self._reload()
+            if not reload_result.get("ok"):
+                reload_error = reload_result.get("error", "Unbound reload failed")
         query_names = self.get_query_names(search=search, source_prefixes=source_prefixes)
         try:
             result = subprocess.run(
@@ -557,22 +561,27 @@ class UnboundManager:
                     threaded_types.get(m.group(1), 0) + int(v))
         query_types = aggregate_types or threaded_types
 
-        return {
+        response = {
             "status": "SUCCESS",
             "global": {
-                "total_queries":     int(total),
-                "cache_hits":        int(hits),
-                "cache_misses":      int(misses),
-                "cache_hit_ratio":   hit_ratio,
-                "num_recursive":     int(n("total.num.recursivereplies")),
+                "total_queries": int(total),
+                "cache_hits": int(hits),
+                "cache_misses": int(misses),
+                "cache_hit_ratio": hit_ratio,
+                "num_recursive": int(n("total.num.recursivereplies")),
                 "recursion_time_avg": round(n("total.recursion.time.avg"), 4),
-                "prefetch":          int(n("total.num.prefetch")),
-                "uptime_seconds":    int(n("time.up")),
+                "prefetch": int(n("total.num.prefetch")),
+                "uptime_seconds": int(n("time.up")),
             },
             "query_types": query_types,
             "query_names": query_names,
             "query_names_tracked": len(self._query_counts),
         }
+
+        if reload_error:
+            response["warning"] = reload_error
+
+        return response
 
     def list_forwarders(self) -> dict:
         """Configured upstream forwarders via ``unbound-control list_forwards``.
