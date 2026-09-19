@@ -193,92 +193,27 @@ class UnboundManager:
                                 f"{reload_result['error']} — the running resolver "
                                 f"is still serving the previous set")}
         logger.info("Synced %d DNS records to Unbound", count)
-        return {"status": "SUCCESS", "records_written": count, "reloaded": True}
-
-    def list_records(self) -> list:
-        """Parse the managed conf file and return records.
-
-        Always opens + parses the conf on every call — the parse is
-        sub-millisecond and callers (status/add/update/delete) that also touch
-        Unbound already pay a far slower unbound-control shell-out. A previous
-        mtime-keyed memo could serve a STALE list when an out-of-band edit
-        landed in the same 1-second st_mtime bucket, so it was removed."""
-        try:
-            os.stat(self.conf_path)
-        except FileNotFoundError:
-            return []
-        records = []
-        with open(self.conf_path) as f:
-            for line in f:
-                line = line.strip()
-                m = re.match(r'local-data:\s+"(.+?)\.\s+(\d+)\s+IN\s+(\w+)\s+(.+?)"', line)
-                if m:
-                    records.append({
-                        "name":  m.group(1),
-                        "ttl":   int(m.group(2)),
-                        "type":  m.group(3),
-                        "value": m.group(4),
-                    })
-                m2 = re.match(r'local-data-ptr:\s+"(\S+)\s+(\d+)\s+(.+?)"', line)
-                if m2:
-                    records.append({
-                        "name":  m2.group(1),
-                        "ttl":   int(m2.group(2)),
-                        "type":  "PTR",
-                        "value": m2.group(3).rstrip("."),
-                    })
-        return records
-
-    def add_record(self, name: str, rtype: str, value: str, ttl: int = 300) -> dict:
-        existing = self.list_records()
-        existing.append({"name": name, "type": rtype, "value": value, "ttl": ttl})
-        return self.sync(existing)
-
-    def update_record(self, name: str, rtype: str, value: str, ttl: int = 300) -> dict:
-        """Replace an existing record's value/ttl (matched by name + type).
-
-        Implemented as a filtered re-sync: the first matching record is swapped
-        for the new value/ttl, duplicates are dropped, and any non-matching
-        records are preserved. If no match exists the record is added. The
-        re-sync regenerates the companion PTR for A/AAAA records automatically.
-        """
-        existing = self.list_records()
-        updated: list = []
-        replaced = False
-        for r in existing:
-            if r["name"] == name and r["type"] == rtype:
-                if not replaced:
-                    updated.append({"name": name, "type": rtype, "value": value, "ttl": ttl})
-                    replaced = True
-                # drop duplicate matches
-            else:
-                updated.append(r)
-        if not replaced:
-            updated.append({"name": name, "type": rtype, "value": value, "ttl": ttl})
-        return self.sync(updated)
-
-    def delete_record(self, name: str, rtype: str = None) -> dict:
-        existing = self.list_records()
-        filtered = [
-            r for r in existing
-            if not (r["name"] == name and (rtype is None or r["type"] == rtype))
-        ]
-        return self.sync(filtered)
-
-    def status(self) -> dict:
-        try:
-            result = subprocess.run(
-                ["unbound-control", "status"],
-                capture_output=True, text=True, timeout=5
-            )
-            running = result.returncode == 0
-        except Exception:
-            running = False
-        return {
-            "running":      running,
-            "record_count": len(self.list_records()),
-            "conf_path":    self.conf_path,
+        response = {
+            "status": "SUCCESS",
+            "global": {
+                "total_queries":     int(total),
+                "cache_hits":        int(hits),
+                "cache_misses":      int(misses),
+                "cache_hit_ratio":   hit_ratio,
+                "num_recursive":     int(n("total.num.recursivereplies")),
+                "recursion_time_avg": round(n("total.recursion.time.avg"), 4),
+                "prefetch":          int(n("total.num.prefetch")),
+                "uptime_seconds":    int(n("time.up")),
+            },
+            "query_types": query_types,
+            "query_names": query_names,
+            "query_names_tracked": len(self._query_counts),
         }
+
+        if reload_error:
+            response["warning"] = reload_error
+
+        return response
 
     def diagnostics(self) -> dict:
         """Return actionable Unbound service, config, listener, and query checks."""
@@ -340,28 +275,27 @@ class UnboundManager:
                 "listener owner, Unbound access-control, and host firewall.")
 
         return {
+        response = {
             "status": "SUCCESS",
-            "healthy": (
-                service["ok"] and config["ok"] and has_lan_listener
-                and (lan_probe_ok if lan_addresses else False)
-            ),
-            "service": service,
-            "config": config,
-            "control": control,
-            "sockets": {
-                "ok": sockets["ok"],
-                "error": sockets["error"],
-                "listeners": listener_lines,
-                "has_port_53_listener": has_listener,
-                "has_lan_listener": has_lan_listener,
+            "global": {
+                "total_queries":     int(total),
+                "cache_hits":        int(hits),
+                "cache_misses":      int(misses),
+                "cache_hit_ratio":   hit_ratio,
+                "num_recursive":     int(n("total.num.recursivereplies")),
+                "recursion_time_avg": round(n("total.recursion.time.avg"), 4),
+                "prefetch":          int(n("total.num.prefetch")),
+                "uptime_seconds":    int(n("time.up")),
             },
-            "configured_interfaces": interfaces,
-            "access_controls": access_controls,
-            "local_ipv4s": lan_addresses,
-            "probes": probes,
-            "recommendations": recommendations,
-            "conf_path": self.conf_path,
+            "query_types": query_types,
+            "query_names": query_names,
+            "query_names_tracked": len(self._query_counts),
         }
+
+        if reload_error:
+            response["warning"] = reload_error
+
+        return response
 
     # ── Statistics & forwarders ───────────────────────────────────────
 
@@ -513,10 +447,13 @@ class UnboundManager:
         for per-tenant filtering — see ``get_query_names``).
         """
         reload_error = None
+
         if not self._ensure_query_logging():
-            reload_result = self._reload()
+            reload_result = self._reload()     # newly-written logging conf needs a reload to take effect
+
             if not reload_result.get("ok"):
-                reload_error = reload_result.get("error", "Unbound reload failed")
+                reload_error = reload_result.get("error", "Unbound is not running")
+
         query_names = self.get_query_names(search=search, source_prefixes=source_prefixes)
         try:
             result = subprocess.run(
@@ -560,18 +497,17 @@ class UnboundManager:
                 threaded_types[m.group(1)] = (
                     threaded_types.get(m.group(1), 0) + int(v))
         query_types = aggregate_types or threaded_types
-
         response = {
             "status": "SUCCESS",
             "global": {
-                "total_queries": int(total),
-                "cache_hits": int(hits),
-                "cache_misses": int(misses),
-                "cache_hit_ratio": hit_ratio,
-                "num_recursive": int(n("total.num.recursivereplies")),
+                "total_queries":     int(total),
+                "cache_hits":        int(hits),
+                "cache_misses":      int(misses),
+                "cache_hit_ratio":   hit_ratio,
+                "num_recursive":     int(n("total.num.recursivereplies")),
                 "recursion_time_avg": round(n("total.recursion.time.avg"), 4),
-                "prefetch": int(n("total.num.prefetch")),
-                "uptime_seconds": int(n("time.up")),
+                "prefetch":          int(n("total.num.prefetch")),
+                "uptime_seconds":    int(n("time.up")),
             },
             "query_types": query_types,
             "query_names": query_names,
@@ -582,231 +518,6 @@ class UnboundManager:
             response["warning"] = reload_error
 
         return response
-
-    def list_forwarders(self) -> dict:
-        """Configured upstream forwarders via ``unbound-control list_forwards``.
-
-        Output lines look like ``. IN forward 8.8.8.8 8.8.4.4`` (zone, class,
-        ``forward``, then the upstream servers). Normalized to a per-zone list
-        of upstreams for the UI's Upstream Servers panel.
-        """
-        try:
-            result = subprocess.run(
-                ["unbound-control", "list_forwards"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode != 0:
-                return {"status": "ERROR", "message": result.stderr.strip() or "unbound-control failed"}
-        except Exception as e:
-            logger.error("list_forwarders failed: %s", e)
-            return {"status": "ERROR", "message": str(e)}
-
-        forwarders = []
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 4 and parts[2] == "forward":
-                forwarders.append({
-                    "zone":      parts[0],
-                    "class":     parts[1],
-                    "upstreams": parts[3:],
-                })
-        return {"status": "SUCCESS", "forwarders": forwarders}
-
-    @staticmethod
-    def _normalize_forward_zone(zone: str) -> str:
-        zone = str(zone or "").strip().lower()
-        if zone == ".":
-            return zone
-        zone = zone.rstrip(".")
-        if not zone or len(zone) > 253:
-            raise ValueError("zone must be '.' or a valid DNS domain")
-        labels = zone.split(".")
-        if any(not re.fullmatch(r"(?!-)[a-z0-9-]{1,63}(?<!-)", label)
-               for label in labels):
-            raise ValueError("zone must be '.' or a valid DNS domain")
-        return zone + "."
-
-    @staticmethod
-    def _normalize_upstreams(upstreams) -> list:
-        if isinstance(upstreams, str):
-            upstreams = re.split(r"[\s,]+", upstreams.strip())
-        values = []
-        for raw in upstreams or []:
-            raw = str(raw).strip()
-            if not raw:
-                continue
-            try:
-                values.append(str(ipaddress.ip_address(raw)))
-            except ValueError as exc:
-                raise ValueError(f"invalid forwarder address: {raw}") from exc
-        if not values:
-            raise ValueError("at least one forwarder address is required")
-        if len(values) > 8:
-            raise ValueError("no more than 8 forwarder addresses are allowed")
-        return list(dict.fromkeys(values))
-
-    def _managed_forwarders(self) -> list:
-        if not os.path.exists(self.forwarders_path):
-            return []
-        forwarders = []
-        current = None
-        with open(self.forwarders_path, encoding="utf-8") as fh:
-            for raw in fh:
-                line = raw.strip()
-                match = re.match(r'name:\s*"([^"]+)"$', line)
-                if match:
-                    current = {"zone": match.group(1), "upstreams": []}
-                    forwarders.append(current)
-                    continue
-                match = re.match(r"forward-addr:\s*(\S+)$", line)
-                if match and current is not None:
-                    current["upstreams"].append(match.group(1))
-        return forwarders
-
-    @staticmethod
-    def _coalesce_forwarders(forwarders: list) -> list:
-        """One ``forward-zone`` block per zone name.
-
-        Unbound takes a zone's upstreams from a single block, so emitting the
-        same name twice is at best redundant and at worst rejected. The writer
-        used to render one block per list entry, so repeated adds for the same
-        zone (the UI defaults the zone field to ".") piled up duplicate
-        ``forward-zone: name: "."`` stanzas. Merging here also heals a file
-        that already drifted, on the next successful write."""
-        merged: dict = {}
-        for item in forwarders or []:
-            zone = str((item or {}).get("zone") or "").strip()
-            if not zone:
-                continue
-            bucket = merged.setdefault(zone, [])
-            for address in (item or {}).get("upstreams") or []:
-                if address not in bucket:
-                    bucket.append(address)
-        return [{"zone": zone, "upstreams": upstreams}
-                for zone, upstreams in merged.items()]
-
-    def _write_forwarders(self, forwarders: list) -> dict:
-        old = None
-        if os.path.exists(self.forwarders_path):
-            with open(self.forwarders_path, "rb") as fh:
-                old = fh.read()
-        tmp_path = self.forwarders_path + ".tmp"
-        lines = ["# Managed by Lab Manager — do not edit manually\n"]
-        for item in self._coalesce_forwarders(forwarders):
-            lines.extend([
-                "forward-zone:\n",
-                f'    name: "{item["zone"]}"\n',
-                *[f"    forward-addr: {address}\n"
-                  for address in item["upstreams"]],
-            ])
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as fh:
-                fh.writelines(lines)
-            os.replace(tmp_path, self.forwarders_path)
-            result = self._reload()
-            if result["ok"]:
-                return {"status": "SUCCESS", "reloaded": True}
-            if old is None:
-                os.remove(self.forwarders_path)
-            else:
-                with open(self.forwarders_path, "wb") as fh:
-                    fh.write(old)
-            self._reload()
-            return {"status": "ERROR", "reloaded": False,
-                    "message": result["error"]}
-        except Exception as exc:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            return {"status": "ERROR", "reloaded": False,
-                    "message": str(exc)}
-
-    def _safe_zone(self, zone) -> str:
-        """``_normalize_forward_zone`` that returns "" instead of raising, for
-        zone names we did not write and cannot vouch for."""
-        try:
-            return self._normalize_forward_zone(zone)
-        except ValueError:
-            return ""
-
-    def add_forwarder(self, zone: str, upstreams) -> dict:
-        """Point a forwarding zone at one or more upstream resolvers.
-
-        Adding to a zone LM already manages MERGES the new addresses in. It
-        used to fail outright with "forwarder zone X already exists", which
-        made the common case impossible: the UI's zone field defaults to ".",
-        so "add an upstream server" is almost always an add against the
-        already-present root zone. Operators saw only the coordinator's
-        "forwarder was not added to all resolvers".
-
-        A zone Unbound serves from config LM does NOT own is still refused —
-        we cannot merge into a file we do not manage."""
-        try:
-            zone = self._normalize_forward_zone(zone)
-            upstreams = self._normalize_upstreams(upstreams)
-        except ValueError as exc:
-            return {"status": "ERROR", "message": str(exc), "changed": False}
-        existing = self._coalesce_forwarders(self._managed_forwarders())
-        current = next((item for item in existing
-                        if self._safe_zone(item.get("zone")) == zone), None)
-        if current is None:
-            live = self.list_forwarders()
-            if live.get("status") != "SUCCESS":
-                return {**live, "changed": False}
-            if any(self._safe_zone(item.get("zone")) == zone
-                   for item in live.get("forwarders") or []):
-                return {"status": "ERROR", "changed": False,
-                        "message": f"forwarder zone {zone} is already served by "
-                                   "Unbound from configuration Lab Manager does "
-                                   "not manage"}
-            merged = [*existing, {"zone": zone, "upstreams": upstreams}]
-            final = upstreams
-        else:
-            known = list(current.get("upstreams") or [])
-            added = [a for a in upstreams if a not in known]
-            if not added:
-                return {"status": "SUCCESS", "changed": False, "zone": zone,
-                        "upstreams": known,
-                        "message": f"forwarder zone {zone} already forwards to "
-                                   + ", ".join(upstreams)}
-            final = known + added
-            if len(final) > 8:
-                return {"status": "ERROR", "changed": False, "zone": zone,
-                        "message": f"forwarder zone {zone} would exceed the "
-                                   "8-address limit"}
-            merged = [{**item, "upstreams": final} if item is current else item
-                      for item in existing]
-        result = self._write_forwarders(merged)
-        return {**result, "zone": zone, "upstreams": final,
-                "changed": result.get("status") == "SUCCESS"}
-
-    def remove_forwarder(self, zone: str) -> dict:
-        """Remove an LM-managed forwarding zone. Used for cluster rollback."""
-        try:
-            zone = self._normalize_forward_zone(zone)
-        except ValueError as exc:
-            return {"status": "ERROR", "message": str(exc)}
-        existing = self._managed_forwarders()
-        kept = [item for item in existing if item.get("zone") != zone]
-        if len(kept) == len(existing):
-            return {"status": "SUCCESS", "changed": False, "zone": zone}
-        result = self._write_forwarders(kept)
-        return {**result, "changed": result.get("status") == "SUCCESS",
-                "zone": zone}
-
-    # ── Helpers ───────────────────────────────────────────────────────
-
-    @staticmethod
-    def _run_diag(cmd, timeout=5):
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout)
-            output = (result.stdout or result.stderr or "").strip()[:2000]
-            return {
-                "ok": result.returncode == 0,
-                "exit_code": result.returncode,
-                "output": output,
-                "error": "" if result.returncode == 0 else (output or "command failed"),
-            }
         except Exception as e:
             return {"ok": False, "exit_code": None, "output": "", "error": str(e)}
 
