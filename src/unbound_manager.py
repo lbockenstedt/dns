@@ -411,7 +411,10 @@ class UnboundManager:
         """
         try:
             st = os.stat(QUERY_LOG)
-        except FileNotFoundError:
+            # Log file does not exist yet - Unbound may not be running
+            # or query logging has not been enabled. Return early without
+            # erroring since _ensure_query_logging() will try to enable it.
+            logger.debug("Query log file not found: %s (Unbound may not be running)", QUERY_LOG)
             return
         except Exception as e:
             logger.debug("stat query log failed: %s", e)
@@ -512,7 +515,17 @@ class UnboundManager:
         for per-tenant filtering — see ``get_query_names``).
         """
         if not self._ensure_query_logging():
-            self._reload()  # newly-written logging conf needs a reload to take effect
+            reload_result = self._reload()   # newly-written logging conf needs a reload to take effect
+            if not reload_result.get("ok"):
+                # Unbound is not running or reload failed - return empty stats with error
+                return {
+                     "status": "ERROR",
+                     "message": reload_result.get("error", "Unbound is not running"),
+                     "global": {},
+                     "query_types": {},
+                     "query_names": [],
+                     "query_names_tracked": 0,
+                 }
         query_names = self.get_query_names(search=search, source_prefixes=source_prefixes)
         try:
             result = subprocess.run(
