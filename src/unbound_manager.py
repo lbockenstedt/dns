@@ -623,13 +623,27 @@ class UnboundManager:
                 "listener owner, Unbound access-control, and host firewall.")
 
         return {
-            "service": "active" if service["ok"] else "inactive",
-            "config_valid": config["ok"],
-            "control_status": control["output"] if control["ok"] else control["error"],
-            "listener_hosts": listener_hosts,
-            "has_lan_listener": has_lan_listener,
-            "lan_probe_ok": lan_probe_ok,
+            "status": "SUCCESS",
+            "healthy": (
+                service["ok"] and config["ok"] and has_lan_listener
+                and (lan_probe_ok if lan_addresses else False)
+            ),
+            "service": service,
+            "config": config,
+            "control": control,
+            "sockets": {
+                "ok": sockets["ok"],
+                "error": sockets["error"],
+                "listeners": listener_lines,
+                "has_port_53_listener": has_listener,
+                "has_lan_listener": has_lan_listener,
+            },
+            "configured_interfaces": interfaces,
+            "access_controls": access_controls,
+            "local_ipv4s": lan_addresses,
+            "probes": probes,
             "recommendations": recommendations,
+            "conf_path": self.conf_path,
         }
 
     @staticmethod
