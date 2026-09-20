@@ -251,70 +251,225 @@ class UnboundManager:
             return {"status": "ERROR", "message": str(e)}
 
     def status(self) -> dict:
-        """Return Unbound service status."""
-        result = self._run_diag(["systemctl", "is-active", "unbound"])
-        return {"status": "active" if result["ok"] else "inactive", "ok": result["ok"]}
+        """Return Unbound service status.
 
-    def list_forwarders(self) -> list:
-        """List configured forwarders."""
+        Preserves the actual systemctl state string (active, inactive, failed,
+        activating, etc.) rather than collapsing distinct failure modes into
+        'inactive', and reports record count and conf path.
+        """
+        result = self._run_diag(["systemctl", "is-active", "unbound"])
+        raw_state = result["output"].strip() if result["output"] else ""
+        if not raw_state:
+            raw_state = "failed" if not result["ok"] else "unknown"
+
+        running = (result["ok"] and raw_state == "active")
+        return {
+            "running": running,
+            "status": raw_state,
+            "service_state": raw_state,
+            "ok": result["ok"],
+            "record_count": len(self.list_records()),
+            "conf_path": self.conf_path,
+        }
+
+    @staticmethod
+    def _normalize_forward_zone(zone: str) -> str:
+        zone = str(zone or "").strip().lower()
+        if zone == ".":
+            return zone
+        zone = zone.rstrip(".")
+        if not zone or len(zone) > 253:
+            raise ValueError("zone must be '.' or a valid DNS domain")
+        labels = zone.split(".")
+        if any(not re.fullmatch(r"(?!-)[a-z0-9-]{1,63}(?<!-)", label)
+               for label in labels):
+            raise ValueError("zone must be '.' or a valid DNS domain")
+        return zone + "."
+
+    @staticmethod
+    def _normalize_upstreams(upstreams) -> list:
+        if isinstance(upstreams, str):
+            upstreams = re.split(r"[\s,]+", upstreams.strip())
+        values = []
+        for raw in upstreams or []:
+            raw = str(raw).strip()
+            if not raw:
+                continue
+            try:
+                values.append(str(ipaddress.ip_address(raw)))
+            except ValueError as exc:
+                raise ValueError(f"invalid forwarder address: {raw}") from exc
+        if not values:
+            raise ValueError("at least one forwarder address is required")
+        if len(values) > 8:
+            raise ValueError("no more than 8 forwarder addresses are allowed")
+        return list(dict.fromkeys(values))
+
+    def _managed_forwarders(self) -> list:
+        if not os.path.exists(self.forwarders_path):
+            return []
         forwarders = []
-        try:
-            with open(self.forwarders_path) as fh:
-                for line in fh:
-                    m = re.match(r'\s*forward-zone:\s*name\s*"([^"]+)"', line)
-                    if m:
-                        forwarders.append({"name": m.group(1)})
-        except OSError:
-            pass
+        zone_map = {}  # zone -> list of upstreams
+        with open(self.forwarders_path, encoding="utf-8") as fh:
+            current = None
+            for raw in fh:
+                line = raw.strip()
+                match = re.match(r'name:\s*"([^"]+)"$', line)
+                if match:
+                    z = match.group(1)
+                    if z not in zone_map:
+                        zone_map[z] = []
+                        forwarders.append({"zone": z, "upstreams": zone_map[z]})
+                    current = zone_map[z]
+                    continue
+                match = re.match(r"forward-addr:\s*(\S+)$", line)
+                if match and current is not None:
+                    addr = match.group(1)
+                    if addr not in current:
+                        current.append(addr)
         return forwarders
 
-    def add_forwarder(self, name: str, ips: list) -> dict:
-        """Add a forwarder zone."""
+    def _write_forwarders(self, forwarders: list) -> dict:
+        old = None
+        if os.path.exists(self.forwarders_path):
+            with open(self.forwarders_path, "rb") as fh:
+                old = fh.read()
+        tmp_path = self.forwarders_path + ".tmp"
+        lines = ["# Managed by Lab Manager — do not edit manually\n"]
+        for item in forwarders:
+            lines.extend([
+                "forward-zone:\n",
+                f'    name: "{item["zone"]}"\n',
+                *[f"    forward-addr: {address}\n"
+                  for address in item["upstreams"]],
+            ])
         try:
-            lines = [f"# Managed by Lab Manager — do not edit manually\n",
-                     f"forward-zone:\n    name: \"{name}\"\n"]
-            for ip in ips:
-                lines.append(f"    forward-addr: {ip}\n")
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                fh.writelines(lines)
+            os.replace(tmp_path, self.forwarders_path)
+            result = self._reload()
+            if result["ok"]:
+                return {"status": "SUCCESS", "reloaded": True}
+            if old is None:
+                try:
+                    os.remove(self.forwarders_path)
+                except OSError:
+                    pass
+            else:
+                with open(self.forwarders_path, "wb") as fh:
+                    fh.write(old)
+            self._reload()
+            return {"status": "ERROR", "reloaded": False,
+                    "message": result["error"]}
+        except Exception as exc:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            return {"status": "ERROR", "reloaded": False,
+                    "message": str(exc)}
 
-            with open(self.forwarders_path, "a") as f:
-                f.writelines(lines)
+    def list_forwarders(self) -> dict:
+        """List configured forwarders.
 
-            reload_result = self._reload()
-            if not reload_result["ok"]:
-                return {"status": "ERROR", "message": reload_result["error"]}
-            return {"status": "SUCCESS", "forwarder": name}
-        except OSError as e:
-            return {"status": "ERROR", "message": str(e)}
+        First attempts querying unbound-control list_forwards. If unbound-control
+        is not available or not running, falls back to parsing the managed
+        forwarders file so configuration remains readable.
+        """
+        try:
+            result = subprocess.run(
+                ["unbound-control", "list_forwards"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                forwarders = []
+                for line in result.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[2] == "forward":
+                        forwarders.append({
+                            "zone": parts[0],
+                            "class": parts[1],
+                            "upstreams": parts[3:],
+                        })
+                return {"status": "SUCCESS", "forwarders": forwarders}
+        except Exception:
+            pass
 
-    def remove_forwarder(self, name: str) -> dict:
+        return {"status": "SUCCESS", "forwarders": self._managed_forwarders()}
+
+    def add_forwarder(self, zone: str = ".", upstreams = None, name: str = None, ips = None) -> dict:
+        """Add a forwarder zone, merging upstreams into existing zones atomically."""
+        if name is not None:
+            zone = name
+        if ips is not None:
+            upstreams = ips
+        try:
+            zone = self._normalize_forward_zone(zone)
+            upstreams = self._normalize_upstreams(upstreams)
+        except ValueError as exc:
+            return {"status": "ERROR", "message": str(exc), "changed": False}
+
+        managed = self._managed_forwarders()
+        managed_zones = {item["zone"] for item in managed}
+
+        live = self.list_forwarders()
+        if isinstance(live, dict) and live.get("status") == "SUCCESS":
+            for item in live.get("forwarders") or []:
+                raw_zone = item.get("zone") or item.get("name")
+                try:
+                    norm = self._normalize_forward_zone(raw_zone)
+                except ValueError:
+                    continue
+                if norm == zone and zone not in managed_zones:
+                    return {
+                        "status": "ERROR",
+                        "message": f"Unbound serves forwarder zone {zone} from configuration Lab Manager does not manage",
+                        "changed": False,
+                    }
+
+        target = None
+        for item in managed:
+            if item["zone"] == zone:
+                target = item
+                break
+
+        if target is None:
+            merged = upstreams
+            changed = True
+            managed.append({"zone": zone, "upstreams": merged})
+        else:
+            current_upstreams = target["upstreams"]
+            merged = list(dict.fromkeys(current_upstreams + upstreams))
+            if len(merged) > 8:
+                return {
+                    "status": "ERROR",
+                    "message": f"zone {zone} exceeds 8-address limit (has {len(merged)})",
+                    "changed": False,
+                }
+            changed = (merged != current_upstreams)
+            target["upstreams"] = merged
+
+        result = self._write_forwarders(managed)
+        if result.get("status") != "SUCCESS":
+            return {**result, "changed": False}
+        return {**result, "zone": zone, "upstreams": merged, "changed": changed}
+
+    def remove_forwarder(self, zone: str = None, name: str = None) -> dict:
         """Remove a forwarder zone."""
+        if name is not None:
+            zone = name
         try:
-            forwarders = self.list_forwarders()
-            if not any(f["name"] == name for f in forwarders):
-                return {"status": "ERROR", "message": f"forwarder {name} not found"}
-
-            with open(self.forwarders_path, "r") as fh:
-                lines = fh.readlines()
-
-            filtered = []
-            skip = False
-            for line in lines:
-                if f'name: "{name}"' in line:
-                    skip = True
-                if skip and line.strip() and not line.startswith(" "):
-                    skip = False
-                if not skip:
-                    filtered.append(line)
-
-            with open(self.forwarders_path, "w") as f:
-                f.writelines(filtered)
-
-            reload_result = self._reload()
-            if not reload_result["ok"]:
-                return {"status": "ERROR", "message": reload_result["error"]}
-            return {"status": "SUCCESS", "removed": name}
-        except OSError as e:
-            return {"status": "ERROR", "message": str(e)}
+            zone = self._normalize_forward_zone(zone)
+        except ValueError as exc:
+            return {"status": "ERROR", "message": str(exc), "changed": False}
+        existing = self._managed_forwarders()
+        kept = [item for item in existing if item.get("zone") != zone]
+        if len(kept) == len(existing):
+            return {"status": "SUCCESS", "changed": False, "zone": zone}
+        result = self._write_forwarders(kept)
+        return {**result, "changed": result.get("status") == "SUCCESS",
+                "zone": zone}
 
     def _run_diag(self, cmd: list) -> dict:
         try:
