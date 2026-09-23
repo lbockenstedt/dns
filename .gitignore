@@ -15,3 +15,4 @@ certs/
 keys.json
 hub_secret.json
 secrets.json
+.worktrees/

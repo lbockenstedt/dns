@@ -175,3 +175,71 @@ def test_remove_still_drops_the_zone(tmp_path, monkeypatch):
     text = _blocks(mgr)
     assert 'name: "lab.example.com."' not in text
     assert 'name: "."' in text
+
+
+def test_remove_nonexistent_zone_is_noop(tmp_path, monkeypatch):
+    mgr = _mgr(tmp_path, monkeypatch)
+    mgr.add_forwarder(".", ["1.1.1.1"])
+    out = mgr.remove_forwarder("nonexistent.example.com")
+    assert out["status"] == "SUCCESS"
+    assert out["changed"] is False
+
+
+def test_update_forwarder_replaces_upstreams_in_place(tmp_path, monkeypatch):
+    mgr = _mgr(tmp_path, monkeypatch)
+    mgr.add_forwarder(".", ["1.1.1.1", "8.8.8.8"])
+    out = mgr.update_forwarder(".", ["9.9.9.9"])
+    assert out["status"] == "SUCCESS"
+    assert out["changed"] is True
+    assert out["upstreams"] == ["9.9.9.9"]
+    text = _blocks(mgr)
+    assert "forward-addr: 9.9.9.9" in text
+    assert "forward-addr: 1.1.1.1" not in text
+    assert "forward-addr: 8.8.8.8" not in text
+
+
+def test_update_forwarder_with_identical_upstreams_reports_unchanged(tmp_path, monkeypatch):
+    mgr = _mgr(tmp_path, monkeypatch)
+    mgr.add_forwarder(".", ["1.1.1.1"])
+    out = mgr.update_forwarder(".", ["1.1.1.1"])
+    assert out["status"] == "SUCCESS"
+    assert out["changed"] is False
+
+
+def test_update_forwarder_nonexistent_zone_errors(tmp_path, monkeypatch):
+    mgr = _mgr(tmp_path, monkeypatch)
+    out = mgr.update_forwarder("ghost.example.com", ["1.1.1.1"])
+    assert out["status"] == "ERROR"
+    assert "not found" in out["message"]
+    assert out["changed"] is False
+
+
+def test_update_forwarder_rename_zone_success(tmp_path, monkeypatch):
+    mgr = _mgr(tmp_path, monkeypatch)
+    mgr.add_forwarder("old.example.com", ["10.0.0.1"])
+    out = mgr.update_forwarder(zone="new.example.com", upstreams=["10.0.0.2"], old_zone="old.example.com")
+    assert out["status"] == "SUCCESS"
+    assert out["changed"] is True
+    assert out["zone"] == "new.example.com."
+    text = _blocks(mgr)
+    assert 'name: "new.example.com."' in text
+    assert 'name: "old.example.com."' not in text
+
+
+def test_update_forwarder_rename_to_existing_zone_fails(tmp_path, monkeypatch):
+    mgr = _mgr(tmp_path, monkeypatch)
+    mgr.add_forwarder("first.example.com", ["10.0.0.1"])
+    mgr.add_forwarder("second.example.com", ["10.0.0.2"])
+    out = mgr.update_forwarder(zone="second.example.com", upstreams=["10.0.0.3"], old_zone="first.example.com")
+    assert out["status"] == "ERROR"
+    assert "already exists" in out["message"]
+    assert out["changed"] is False
+
+
+def test_update_forwarder_exceeding_eight_addresses_fails(tmp_path, monkeypatch):
+    mgr = _mgr(tmp_path, monkeypatch)
+    mgr.add_forwarder(".", ["1.1.1.1"])
+    out = mgr.update_forwarder(".", [f"10.0.0.{i}" for i in range(1, 10)])
+    assert out["status"] == "ERROR"
+    assert out["changed"] is False
+

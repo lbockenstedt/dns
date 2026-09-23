@@ -87,6 +87,9 @@ class DNSSpoke(BaseSpoke):
       DNS_STATUS        — Unbound process status + record count
       DNS_STATS         — unbound-control stats_noreset counters for the WebUI
       DNS_FORWARDERS    — unbound-control list_forwards upstream resolvers
+      DNS_FORWARDER_ADD — add persistent forwarding zone across resolvers
+      DNS_FORWARDER_UPDATE — update persistent forwarding zone across resolvers
+      DNS_FORWARDER_REMOVE — remove persistent forwarding zone across resolvers
       DNS_DIAGNOSTICS   — service/config/listener/query health evidence
       DNS_CLUSTER_STATUS    — member stats, convergence, drift, recommendations
       DNS_CLUSTER_CONFIG    — set the resolver member list (+ worker secret)
@@ -539,6 +542,49 @@ class DNSSpoke(BaseSpoke):
         return {"status": "ERROR", "message": message,
                 "members": fan["results"], "rollback": rollback}
 
+    async def _cluster_remove_forwarder(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Fan out DNSW_FORWARDER_REMOVE to all cluster resolver members."""
+        zone = data.get("zone", data.get("name", "."))
+        fan = await self._transport.fanout(
+            "DNSW_FORWARDER_REMOVE", {"zone": zone}, timeout=20.0)
+        if not fan.get("failed"):
+            return {"status": "SUCCESS", "zone": zone, "members": fan["results"]}
+        failed = ", ".join(fan.get("failed") or [])
+        reasons = []
+        for member_id in (fan.get("failed") or []):
+            reason = str(((fan.get("results") or {}).get(member_id)
+                          or {}).get("message") or "").strip()
+            if reason and reason not in reasons:
+                reasons.append(reason)
+        message = f"forwarder was not removed from all resolvers ({failed})"
+        if reasons:
+            message += ": " + "; ".join(reasons)
+        return {"status": "ERROR", "message": message, "members": fan["results"]}
+
+    async def _cluster_update_forwarder(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Fan out DNSW_FORWARDER_UPDATE to all cluster resolver members."""
+        payload = {
+            "zone": data.get("zone", "."),
+            "upstreams": data.get("upstreams", []),
+            "old_zone": data.get("old_zone"),
+        }
+        fan = await self._transport.fanout(
+            "DNSW_FORWARDER_UPDATE", payload, timeout=20.0)
+        if not fan.get("failed"):
+            return {"status": "SUCCESS", "zone": payload["zone"],
+                    "upstreams": payload["upstreams"], "members": fan["results"]}
+        failed = ", ".join(fan.get("failed") or [])
+        reasons = []
+        for member_id in (fan.get("failed") or []):
+            reason = str(((fan.get("results") or {}).get(member_id)
+                          or {}).get("message") or "").strip()
+            if reason and reason not in reasons:
+                reasons.append(reason)
+        message = f"forwarder was not updated on all resolvers ({failed})"
+        if reasons:
+            message += ": " + "; ".join(reasons)
+        return {"status": "ERROR", "message": message, "members": fan["results"]}
+
     async def _cluster_status_summary(self) -> Dict[str, Any]:
         """DNS_STATUS in cluster mode — never one host's answer for the pair."""
         await self.cluster.refresh_state()
@@ -623,6 +669,10 @@ class DNSSpoke(BaseSpoke):
                 return await self._cluster_forwarders()
             if cmd == "DNS_FORWARDER_ADD":
                 return await self._cluster_add_forwarder(data)
+            if cmd in ("DNS_FORWARDER_REMOVE", "DNS_FORWARDER_DELETE"):
+                return await self._cluster_remove_forwarder(data)
+            if cmd in ("DNS_FORWARDER_UPDATE", "DNS_FORWARDER_EDIT"):
+                return await self._cluster_update_forwarder(data)
 
         # UnboundManager does sync subprocess.run (unbound-control reload/status/
         # stats_noreset/list_forwards, 5-10s timeouts) + sync conf writes. This
@@ -684,6 +734,20 @@ class DNSSpoke(BaseSpoke):
                 self.mgr.add_forwarder,
                 data.get("zone", "."),
                 data.get("upstreams", []),
+            )
+
+        if cmd in ("DNS_FORWARDER_REMOVE", "DNS_FORWARDER_DELETE"):
+            return await asyncio.to_thread(
+                self.mgr.remove_forwarder,
+                zone=data.get("zone", data.get("name", ".")),
+            )
+
+        if cmd in ("DNS_FORWARDER_UPDATE", "DNS_FORWARDER_EDIT"):
+            return await asyncio.to_thread(
+                self.mgr.update_forwarder,
+                zone=data.get("zone", "."),
+                upstreams=data.get("upstreams", []),
+                old_zone=data.get("old_zone"),
             )
 
         return {"status": "ERROR", "error": f"Unknown command: {command_type}"}
