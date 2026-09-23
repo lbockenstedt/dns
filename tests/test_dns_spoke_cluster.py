@@ -58,6 +58,18 @@ class FakeMgr:
         return {"status": "SUCCESS", "forwarders": [
             {"zone": ".", "class": "IN", "upstreams": ["1.1.1.1"]}]}
 
+    def add_forwarder(self, zone, upstreams):
+        self.calls.append(("add_forwarder", zone, upstreams))
+        return {"status": "SUCCESS", "zone": zone, "upstreams": upstreams, "changed": True}
+
+    def update_forwarder(self, zone=".", upstreams=None, old_zone=None):
+        self.calls.append(("update_forwarder", zone, upstreams, old_zone))
+        return {"status": "SUCCESS", "zone": zone, "upstreams": upstreams, "changed": True}
+
+    def remove_forwarder(self, zone=None, name=None):
+        self.calls.append(("remove_forwarder", zone or name))
+        return {"status": "SUCCESS", "zone": zone or name, "changed": True}
+
 
 class FakeTransport:
     def __init__(self, members):
@@ -386,6 +398,59 @@ def test_clustered_forwarder_add_rolls_back_partial_write(tmp_path):
         {"zone": "."},
         ("dns-a", "dns-b"),
     )
+
+
+def test_clustered_forwarder_remove_reaches_every_member(tmp_path):
+    spoke = _spoke(tmp_path, members=("dns-a", "dns-b"))
+    out = _run(spoke.handle_command("DNS_FORWARDER_REMOVE", {"zone": "example.com"}))
+    assert out["status"] == "SUCCESS"
+    assert spoke._transport.sent[-1] == (
+        "DNSW_FORWARDER_REMOVE",
+        {"zone": "example.com"},
+        ("dns-a", "dns-b"),
+    )
+
+
+def test_clustered_forwarder_update_reaches_every_member(tmp_path):
+    spoke = _spoke(tmp_path, members=("dns-a", "dns-b"))
+    out = _run(spoke.handle_command("DNS_FORWARDER_UPDATE", {
+        "zone": "example.com", "upstreams": ["1.1.1.1", "1.0.0.1"], "old_zone": "old.example.com",
+    }))
+    assert out["status"] == "SUCCESS"
+    assert spoke._transport.sent[-1] == (
+        "DNSW_FORWARDER_UPDATE",
+        {"zone": "example.com", "upstreams": ["1.1.1.1", "1.0.0.1"], "old_zone": "old.example.com"},
+        ("dns-a", "dns-b"),
+    )
+
+
+def test_clustered_forwarder_remove_surfaces_failure(tmp_path):
+    spoke = _spoke(tmp_path, members=("dns-a", "dns-b"))
+    spoke._transport.fail_ops.add(("dns-b", "DNSW_FORWARDER_REMOVE"))
+    out = _run(spoke.handle_command("DNS_FORWARDER_REMOVE", {"zone": "."}))
+    assert out["status"] == "ERROR"
+    assert "not removed from all resolvers" in out["message"]
+
+
+def test_clustered_forwarder_update_surfaces_failure(tmp_path):
+    spoke = _spoke(tmp_path, members=("dns-a", "dns-b"))
+    spoke._transport.fail_ops.add(("dns-b", "DNSW_FORWARDER_UPDATE"))
+    out = _run(spoke.handle_command("DNS_FORWARDER_UPDATE", {"zone": ".", "upstreams": ["8.8.8.8"]}))
+    assert out["status"] == "ERROR"
+    assert "not updated on all resolvers" in out["message"]
+
+
+def test_single_host_forwarder_remove_and_update(tmp_path):
+    spoke = _spoke(tmp_path)
+    res_del = _run(spoke.handle_command("DNS_FORWARDER_REMOVE", {"zone": "example.com"}))
+    assert res_del["status"] == "SUCCESS"
+    assert ("remove_forwarder", "example.com") in spoke.mgr.calls
+
+    res_upd = _run(spoke.handle_command("DNS_FORWARDER_UPDATE", {
+        "zone": "new.com", "upstreams": ["1.1.1.1"], "old_zone": "old.com",
+    }))
+    assert res_upd["status"] == "SUCCESS"
+    assert ("update_forwarder", "new.com", ["1.1.1.1"], "old.com") in spoke.mgr.calls
 
 
 # ── Item 8: fail-closed surfaces as an actionable error ────────────────────

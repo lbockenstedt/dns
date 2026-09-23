@@ -455,8 +455,73 @@ class UnboundManager:
             return {**result, "changed": False}
         return {**result, "zone": zone, "upstreams": merged, "changed": changed}
 
+    def update_forwarder(self, zone: str = ".", upstreams = None, name: str = None, ips = None, old_zone: str = None) -> dict:
+        """Update a forwarder zone, replacing upstreams in-place (not merging).
+
+        Parameters:
+            zone: Target forwarder domain name (e.g. '.' or 'example.com').
+            upstreams: List or iterable of IPv4/IPv6 addresses to forward to.
+            name: Alternative alias for `zone`.
+            ips: Alternative alias for `upstreams`.
+            old_zone: Optional previous zone domain when renaming a forwarder zone.
+
+        Returns:
+            Dict containing operation status ('SUCCESS' or 'ERROR'), updated zone,
+            upstreams list, and changed boolean indicator.
+        """
+        if name is not None:
+            zone = name
+        if ips is not None:
+            upstreams = ips
+        try:
+            zone = self._normalize_forward_zone(zone)
+            upstreams = self._normalize_upstreams(upstreams)
+            if old_zone is not None:
+                old_zone = self._normalize_forward_zone(old_zone)
+        except ValueError as exc:
+            return {"status": "ERROR", "message": str(exc), "changed": False}
+
+        if len(upstreams) > 8:
+            return {
+                "status": "ERROR",
+                "message": f"zone {zone} exceeds 8-address limit (has {len(upstreams)})",
+                "changed": False,
+            }
+
+        managed = self._managed_forwarders()
+        target_zone = old_zone if old_zone is not None else zone
+        target = None
+        for item in managed:
+            if item.get("zone") == target_zone:
+                target = item
+                break
+
+        if target is None:
+            return {"status": "ERROR", "message": f"forwarder zone {target_zone} not found", "changed": False}
+
+        if old_zone is not None and old_zone != zone:
+            if any(item.get("zone") == zone for item in managed):
+                return {"status": "ERROR", "message": f"forwarder zone {zone} already exists", "changed": False}
+            target["zone"] = zone
+
+        changed = (target.get("upstreams") != upstreams) or (old_zone is not None and old_zone != zone)
+        target["upstreams"] = upstreams
+
+        result = self._write_forwarders(managed)
+        if result.get("status") != "SUCCESS":
+            return {**result, "changed": False}
+        return {**result, "zone": target["zone"], "upstreams": upstreams, "changed": changed}
+
     def remove_forwarder(self, zone: str = None, name: str = None) -> dict:
-        """Remove a forwarder zone."""
+        """Remove a managed forwarder zone from Unbound configuration.
+
+        Parameters:
+            zone: Zone domain to remove (e.g. 'example.com.').
+            name: Alternative alias for `zone`.
+
+        Returns:
+            Dict with status ('SUCCESS' or 'ERROR'), changed boolean, and zone.
+        """
         if name is not None:
             zone = name
         try:
