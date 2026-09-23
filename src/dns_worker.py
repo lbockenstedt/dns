@@ -174,10 +174,20 @@ class DnsWorkerOps:
         return self.mgr.list_forwarders()
 
     def add_forwarder(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Add a forwarder zone, merging upstreams into existing configuration."""
         return self.mgr.add_forwarder(
             data.get("zone", "."), data.get("upstreams", []))
 
+    def update_forwarder(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Update an existing forwarder zone in-place with new upstream servers."""
+        return self.mgr.update_forwarder(
+            zone=data.get("zone", "."),
+            upstreams=data.get("upstreams", []),
+            old_zone=data.get("old_zone"),
+        )
+
     def remove_forwarder(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove a managed forwarder zone from this resolver's Unbound instance."""
         return self.mgr.remove_forwarder(data.get("zone", ""))
 
     def op_table(self) -> Dict[str, Any]:
@@ -189,6 +199,7 @@ class DnsWorkerOps:
             "DNSW_STATS": self.stats,
             "DNSW_FORWARDERS": self.forwarders,
             "DNSW_FORWARDER_ADD": self.add_forwarder,
+            "DNSW_FORWARDER_UPDATE": self.update_forwarder,
             "DNSW_FORWARDER_REMOVE": self.remove_forwarder,
             "DNSW_STANDDOWN": self.standdown,
         }
