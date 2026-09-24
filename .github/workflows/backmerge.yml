@@ -93,6 +93,7 @@ jobs:
             target: dev
     steps:
       - uses: actions/checkout@v4
+        if: matrix.source == github.ref_name
         with:
           fetch-depth: 0
 
