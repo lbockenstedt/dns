@@ -269,7 +269,9 @@ jobs:
             printf '## Guardrails & Side-Effect Assessment\n\n'
             printf -- '- Every tracked `VERSION` file is pinned to `%s`'"'"'s own sequence and\n' "$TGT"
             printf '  advanced one step here; a version set on `%s` never leaks across.\n' "$SRC"
-            if [ -n "$automation" ]; then
+            if [ "$nfiles_ok" != "yes" ]; then
+              printf -- '- Automation impact UNKNOWN (`git diff` failed).\n'
+            elif [ -n "$automation" ]; then
               printf -- '- This promotion changes **automation**, so it is not behaviour-neutral.\n'
               printf '  Workflow/script paths touched:\n\n%s\n' "$automation"
             else
