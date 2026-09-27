@@ -85,7 +85,9 @@ fi
 [ "${#units[@]}" -gt 0 ] || units=("origin/$SRC")
 
 # Build $BR as "$TGT plus everything up to <endpoint>", VERSION pinned.
-# Returns 0 when that produced a real change, 1 when it is a content no-op.
+# Returns 0 when that produced a real change and 1 when it is a content no-op.
+# A merge conflict outside VERSION is NOT a return code: stage_to prints the
+# conflicting files and exits the whole script with status 1.
 stage_to() {
   local endpoint="$1"
 
@@ -181,15 +183,26 @@ if [ "$SPLIT" = "1" ]; then
   if [ "$ext_idx" -ne "$picked_idx" ]; then
     echo "  extending unit $picked_idx -> $ext_idx: later unit(s) modify the same" \
          "file(s); promoting an already-superseded version would be rejected"
-    if stage_to "${units[$ext_idx]}"; then
+    ext_rc=0
+    stage_to "${units[$ext_idx]}" || ext_rc=$?
+    if [ "$ext_rc" -eq 0 ]; then
       picked="${units[$ext_idx]}"
       picked_idx="$ext_idx"
     else
-      # Cannot happen (a superset of a real change is a real change), but if
-      # it ever did, fall back to the unextended unit rather than promoting a
-      # half-staged tree.
+      # Only reachable with ext_rc=1 (content no-op); a conflict already exited
+      # inside stage_to. Should not happen: a superset of a real change is real.
       echo "::warning::extension to ${units[$ext_idx]} was a content no-op -- keeping unit $picked_idx"
-      stage_to "$picked" || true
+      # The worktree is now staged against the WRONG endpoint, so the original
+      # unit must be restaged before committing. Check the result rather than
+      # discarding it (|| true), so a restage that does not reproduce a real
+      # change aborts instead of committing an empty or wrong tree.
+      re_rc=0
+      stage_to "$picked" || re_rc=$?
+      if [ "$re_rc" -ne 0 ]; then
+        echo "::error::could not restage $picked after the failed extension (exit $re_rc) --" \
+             "refusing to promote a half-staged tree"
+        exit 1
+      fi
     fi
   fi
 fi
