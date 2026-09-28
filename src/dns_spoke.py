@@ -406,13 +406,16 @@ class DNSSpoke(BaseSpoke):
             "recommendations": recommendations,
         }
 
-    async def _cluster_stats(self, search: str = None, source_prefixes: list = None) -> Dict[str, Any]:
+    async def _cluster_stats(self, search: str = None, source_prefixes: list = None,
+                              range_days: int = None) -> Dict[str, Any]:
         """Cluster stats: per-member counters plus the summed headline totals."""
         payload = {}
         if search:
             payload["search"] = search
         if source_prefixes:
             payload["source_prefixes"] = source_prefixes
+        if range_days:
+            payload["range_days"] = range_days
         fan = await self._transport.fanout("DNSW_STATS", payload, timeout=20.0)
         per_member: Dict[str, Any] = {}
         member_errors: Dict[str, str] = {}
@@ -664,7 +667,8 @@ class DNSSpoke(BaseSpoke):
                 return await self._cluster_diagnostics()
             if cmd == "DNS_STATS":
                 return await self._cluster_stats(search=data.get("search"),
-                                                 source_prefixes=data.get("source_prefixes"))
+                                                 source_prefixes=data.get("source_prefixes"),
+                                                 range_days=data.get("range_days"))
             if cmd == "DNS_FORWARDERS":
                 return await self._cluster_forwarders()
             if cmd == "DNS_FORWARDER_ADD":
@@ -724,7 +728,8 @@ class DNSSpoke(BaseSpoke):
         if cmd == "DNS_STATS":
             search = data.get("search")
             source_prefixes = data.get("source_prefixes")
-            return await asyncio.to_thread(self.mgr.get_stats, search, source_prefixes)
+            range_days = data.get("range_days")
+            return await asyncio.to_thread(self.mgr.get_stats, search, source_prefixes, range_days)
 
         if cmd == "DNS_FORWARDERS":
             return await asyncio.to_thread(self.mgr.list_forwarders)

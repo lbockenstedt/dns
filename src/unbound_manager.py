@@ -19,6 +19,14 @@ QUERY_LOG = "/var/log/unbound/lm-queries.log"
 MAX_TRACKED_NAMES = 5000
 TOP_NAMES_LIMIT = 200
 
+# WebUI day/week/month selector for the "Queries by Destination" breakdown.
+# Counts are kept in per-day buckets (see _query_counts) so a window can be
+# summed on read; MAX_RETENTION_DAYS caps how much history is kept at all —
+# once a bucket is older than that it is pruned regardless of which window
+# is currently selected.
+RANGE_DAYS = {"day": 1, "week": 7, "month": 30}
+MAX_RETENTION_DAYS = 30
+
 _QUERY_LOG_RE = re.compile(
     r"info:\s+(?P<ip>[0-9a-fA-F.:]+)\s+(?P<name>\S+?)\.?\s+(?P<type>\w+)\s+IN\s*$"
 )
@@ -32,6 +40,9 @@ class UnboundManager:
         os.makedirs(os.path.dirname(self.conf_path), exist_ok=True)
         self._ensure_conf_included()
 
+        # key ("name|TYPE|ip") -> {day_epoch: count}. Bucketing by day (rather
+        # than one lifetime counter) is what makes the day/week/month window
+        # and the 30-day retention drop possible.
         self._query_counts = {}
         self._query_log_offset = 0
         self._query_log_inode = None
@@ -662,14 +673,34 @@ class UnboundManager:
                     key = f"{name}|{rtype}|{ip}"
                     if key not in self._query_counts and len(self._query_counts) >= MAX_TRACKED_NAMES:
                         continue
-                    self._query_counts[key] = self._query_counts.get(key, 0) + 1
+                    day = int(time.time() // 86400)
+                    bucket = self._query_counts.setdefault(key, {})
+                    bucket[day] = bucket.get(day, 0) + 1
                 self._query_log_offset = f.tell()
         except Exception as e:
             logger.warning("failed tailing unbound query log: %s", e)
+        self._prune_query_counts()
+
+    def _prune_query_counts(self) -> None:
+        """Age out day-buckets older than MAX_RETENTION_DAYS so tracked query
+        history never grows unbounded and drops on its own, independent of
+        whichever day/week/month window the WebUI happens to be viewing."""
+        cutoff = int(time.time() // 86400) - MAX_RETENTION_DAYS + 1
+        empty_keys = []
+        for key, buckets in self._query_counts.items():
+            for day in [d for d in buckets if d < cutoff]:
+                del buckets[day]
+            if not buckets:
+                empty_keys.append(key)
+        for key in empty_keys:
+            del self._query_counts[key]
 
     def get_query_names(self, search: str = None, limit: int = TOP_NAMES_LIMIT,
-                         source_prefixes: list = None) -> list:
-        """Per-(name,type) query counters, sorted by count desc."""
+                         source_prefixes: list = None, range_days: int = None) -> list:
+        """Per-(name,type) query counters, sorted by count desc. ``range_days``
+        (1/7/30 for the WebUI's day/week/month selector) sums only the
+        trailing N days of buckets; omitted/None sums everything still
+        retained (at most MAX_RETENTION_DAYS, enforced by _prune_query_counts)."""
         self._tail_query_log()
         needle = (search or "").strip().lower()
         nets = None
@@ -680,8 +711,11 @@ class UnboundManager:
                     nets.append(ipaddress.ip_network(p, strict=False))
                 except ValueError:
                     continue
+        cutoff_day = None
+        if range_days:
+            cutoff_day = int(time.time() // 86400) - int(range_days) + 1
         grouped = {}
-        for key, count in self._query_counts.items():
+        for key, buckets in self._query_counts.items():
             name, rtype, ip = key.split("|", 2)
             if needle and needle not in name:
                 continue
@@ -692,6 +726,9 @@ class UnboundManager:
                     continue
                 if not any(addr in n for n in nets):
                     continue
+            count = sum(c for d, c in buckets.items() if cutoff_day is None or d >= cutoff_day)
+            if not count:
+                continue
             gkey = f"{name}|{rtype}"
             g = grouped.setdefault(gkey, {"name": name, "type": rtype, "count": 0, "sources": {}})
             g["count"] += count
@@ -708,8 +745,14 @@ class UnboundManager:
             rows = rows[:limit]
         return rows
 
-    def get_stats(self, search: str = None, source_prefixes: list = None) -> dict:
-        """Unbound query statistics via unbound-control stats_noreset."""
+    def get_stats(self, search: str = None, source_prefixes: list = None,
+                  range_days: int = None) -> dict:
+        """Unbound query statistics via unbound-control stats_noreset.
+
+        ``range_days`` only narrows the ``query_names`` (per-destination)
+        breakdown — the ``global``/``query_types`` counters below come
+        straight from unbound-control's own lifetime totals, which Unbound
+        itself does not bucket by day."""
         reload_error = None
 
         if not self._ensure_query_logging():
@@ -717,7 +760,8 @@ class UnboundManager:
             if not reload_result.get("ok"):
                 reload_error = reload_result.get("error", "Unbound is not running")
 
-        query_names = self.get_query_names(search=search, source_prefixes=source_prefixes)
+        query_names = self.get_query_names(search=search, source_prefixes=source_prefixes,
+                                            range_days=range_days)
         try:
             result = subprocess.run(
                 ["unbound-control", "stats_noreset"],
