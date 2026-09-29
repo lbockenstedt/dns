@@ -66,8 +66,11 @@ class FakeMgr:
         self._tid()
         return {"running": True, "record_count": 3, "conf_path": "/etc/unbound/conf.d/lm-netbox.conf"}
 
-    def get_stats(self, search=None, source_prefixes=None):
-        self.calls.append(("get_stats", search, source_prefixes))
+    def get_stats(self, search=None, source_prefixes=None, range_days=None):
+        # range_days is RECORDED, not just tolerated: DnsWorkerOps.stats passes
+        # it through from the request, and a double that silently swallowed it
+        # would let a regression in that pass-through go unnoticed.
+        self.calls.append(("get_stats", search, source_prefixes, range_days))
         self._tid()
         return {"status": "SUCCESS", "global": {"total_queries": 10}}
 
