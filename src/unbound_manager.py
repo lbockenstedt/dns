@@ -620,6 +620,45 @@ class UnboundManager:
         except ValueError:
             return ""
 
+    def _ensure_apparmor_log_access(self) -> bool:
+        """Let the confined ``unbound`` daemon create/write the query log.
+
+        Debian/Ubuntu ship an AppArmor profile for unbound that does NOT allow
+        /var/log/unbound/. With it enforcing, unbound's mknod of QUERY_LOG is
+        DENIED, so the logfile directive silently produces nothing (the lines go
+        to the journal instead) and the per-destination breakdown stays empty
+        forever even though the conf and directory ownership are correct. The
+        supported hook is the ``local/`` override. Returns True only when the
+        override was changed (profile reloaded + unbound restarted so it
+        reopens its logfile); a host without AppArmor is a no-op."""
+        local_dir = "/etc/apparmor.d/local"
+        profile = "/etc/apparmor.d/usr.sbin.unbound"
+        rule = f"{os.path.dirname(QUERY_LOG)}/** rw,\n"
+        if not os.path.isdir(local_dir) or not os.path.exists(profile):
+            return False
+        override = os.path.join(local_dir, "usr.sbin.unbound")
+        try:
+            current = open(override).read() if os.path.exists(override) else ""
+            if rule in current:
+                return False
+            with open(override, "a") as f:
+                if current and not current.endswith("\n"):
+                    f.write("\n")
+                f.write("# Managed by Lab Manager — unbound query log (DNS stats)\n" + rule)
+        except Exception as e:
+            logger.warning("could not update AppArmor override %s: %s", override, e)
+            return False
+        try:
+            subprocess.run(["apparmor_parser", "-r", profile], check=True,
+                           capture_output=True, timeout=30)
+            subprocess.run(["systemctl", "restart", "unbound"], check=True,
+                           capture_output=True, timeout=30)
+            logger.info("AppArmor: allowed unbound to write %s; profile reloaded, unbound restarted",
+                        QUERY_LOG)
+        except Exception as e:
+            logger.warning("AppArmor override written but reload/restart failed: %s", e)
+        return True
+
     def _ensure_query_logging(self) -> bool:
         """Self-enable Unbound query logging on first use."""
         want = (f'server:\n    log-queries: yes\n'
@@ -628,11 +667,12 @@ class UnboundManager:
             os.makedirs(os.path.dirname(QUERY_LOG), exist_ok=True)
         except Exception as e:
             logger.warning("could not create unbound log dir: %s", e)
+        apparmor_changed = self._ensure_apparmor_log_access()
         try:
             current = open(LOGGING_CONF).read() if os.path.exists(LOGGING_CONF) else ""
         except Exception:
             current = ""
-        if current == want:
+        if current == want and not apparmor_changed:
             return True
         try:
             with open(LOGGING_CONF, "w") as f:
