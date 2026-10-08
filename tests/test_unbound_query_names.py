@@ -8,6 +8,7 @@ UnboundManager against a plain temp file standing in for the query log.
 """
 
 import os
+import time
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -17,7 +18,7 @@ from unbound_manager import UnboundManager
 
 
 QUERY_LINES = [
-    "[1700000000] unbound[1:0] info: 172.17.1.5 www.dwx.com. A IN\n",
+    f"[{int(time.time())}] unbound[1:0] info: 172.17.1.5 www.dwx.com. A IN\n",
     "info: 172.17.1.5 www.dwx.com. A IN\n",
     "info: 172.17.1.6 api.dwx.com. AAAA IN\n",
     "info: 172.17.1.5 www.dwx.com. A IN\n",
@@ -254,3 +255,19 @@ def test_get_stats_source_prefixes_threaded_through(mock_run, tmp_path, monkeypa
 
     result = mgr.get_stats(source_prefixes=["172.17.1.0/24"])
     assert [q["name"] for q in result["query_names"]] == ["www.dwx.com"]
+
+
+def test_get_client_queries_filters_by_client_and_window(tmp_path, monkeypatch, mgr):
+    _patch_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(mgr, "_ensure_query_logging", lambda: True)
+    now = int(time.time())
+    with open(um_mod.QUERY_LOG, "w") as f:
+        f.write(f"[{now - 30}] unbound[1:0] info: 172.17.1.5 a.dwx.com. A IN\n")
+        f.write(f"[{now - 3600}] unbound[1:0] info: 172.17.1.5 old.dwx.com. A IN\n")
+        f.write(f"[{now - 10}] unbound[1:0] info: 172.17.1.6 b.dwx.com. AAAA IN\n")
+
+    out = mgr.get_client_queries("172.17.1.5", minutes=5)
+    assert [q["name"] for q in out["queries"]] == ["a.dwx.com"]
+    out = mgr.get_client_queries("172.17.1.5", minutes=120)
+    assert [q["name"] for q in out["queries"]] == ["a.dwx.com", "old.dwx.com"]
+    assert mgr.get_client_queries("", minutes=5)["total"] == 2
