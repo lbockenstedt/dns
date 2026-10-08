@@ -166,6 +166,11 @@ class DnsWorkerOps:
         return self.mgr.get_stats(data.get("search"), data.get("source_prefixes"),
                                    data.get("range_days"))
 
+    def client_queries(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        return self.mgr.get_client_queries(
+            data.get("client"), data.get("minutes", 10), data.get("search"),
+            source_prefixes=data.get("source_prefixes"))
+
     def forwarders(self, _data: Dict[str, Any]) -> Dict[str, Any]:
         """``DNSW_FORWARDERS`` — this resolver's own upstream forwarders.
 
@@ -198,6 +203,7 @@ class DnsWorkerOps:
             "DNSW_STATUS": self.status,
             "DNSW_DIAGNOSTICS": self.diagnostics,
             "DNSW_STATS": self.stats,
+            "DNSW_CLIENT_QUERIES": self.client_queries,
             "DNSW_FORWARDERS": self.forwarders,
             "DNSW_FORWARDER_ADD": self.add_forwarder,
             "DNSW_FORWARDER_UPDATE": self.update_forwarder,

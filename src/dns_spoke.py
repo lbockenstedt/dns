@@ -406,6 +406,29 @@ class DNSSpoke(BaseSpoke):
             "recommendations": recommendations,
         }
 
+    async def _cluster_client_queries(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge every member's per-client query log, newest first."""
+        fan = await self._transport.fanout("DNSW_CLIENT_QUERIES", data, timeout=20.0)
+        queries, errors = [], {}
+        for member_id, reply in (fan.get("results") or {}).items():
+            if not isinstance(reply, dict) or reply.get("status") != "SUCCESS":
+                errors[member_id] = ((reply.get("message") if isinstance(reply, dict) else None)
+                                     or "no response")
+                continue
+            for q in reply.get("queries") or []:
+                queries.append({**q, "resolver": member_id})
+        queries.sort(key=lambda q: q.get("time", 0), reverse=True)
+        summary = {}
+        for q in queries:
+            k = (q.get("name"), q.get("type"))
+            summary[k] = summary.get(k, 0) + 1
+        top = sorted(({"name": n, "type": t, "count": c} for (n, t), c in summary.items()),
+                     key=lambda x: x["count"], reverse=True)[:100]
+        return {"status": "SUCCESS", "client": data.get("client", ""),
+                "minutes": data.get("minutes", 10), "total": len(queries),
+                "queries": queries[:1000], "top_names": top, "cluster": True,
+                "member_errors": errors}
+
     async def _cluster_stats(self, search: str = None, source_prefixes: list = None,
                               range_days: int = None) -> Dict[str, Any]:
         """Cluster stats: per-member counters plus the summed headline totals."""
@@ -669,6 +692,8 @@ class DNSSpoke(BaseSpoke):
                 return await self._cluster_stats(search=data.get("search"),
                                                  source_prefixes=data.get("source_prefixes"),
                                                  range_days=data.get("range_days"))
+            if cmd == "DNS_CLIENT_QUERIES":
+                return await self._cluster_client_queries(data)
             if cmd == "DNS_FORWARDERS":
                 return await self._cluster_forwarders()
             if cmd == "DNS_FORWARDER_ADD":
@@ -730,6 +755,11 @@ class DNSSpoke(BaseSpoke):
             source_prefixes = data.get("source_prefixes")
             range_days = data.get("range_days")
             return await asyncio.to_thread(self.mgr.get_stats, search, source_prefixes, range_days)
+
+        if cmd == "DNS_CLIENT_QUERIES":
+            return await asyncio.to_thread(
+                self.mgr.get_client_queries, data.get("client"), data.get("minutes", 10),
+                data.get("search"), source_prefixes=data.get("source_prefixes"))
 
         if cmd == "DNS_FORWARDERS":
             return await asyncio.to_thread(self.mgr.list_forwarders)
