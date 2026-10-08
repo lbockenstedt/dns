@@ -138,6 +138,10 @@ class UnboundManager:
         with open(self.conf_path, "w") as f:
             f.writelines(lines)
 
+        # Query logging is on by default: every sync (NetBox auto-sync runs
+        # regularly) idempotently guarantees it, not just a WebUI stats view.
+        self._ensure_query_logging()
+
         reload_result = self._reload()
         if not reload_result["ok"]:
             logger.error("Wrote %d DNS records but unbound-control reload failed: %s",
