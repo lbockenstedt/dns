@@ -138,9 +138,14 @@ def test_get_query_names_limit_truncates_results(tmp_path, monkeypatch, mgr):
 def test_ensure_query_logging_writes_conf_once(tmp_path, monkeypatch, mgr):
     _patch_paths(tmp_path, monkeypatch)
     assert not os.path.exists(um_mod.LOGGING_CONF)
+    restart_calls = []
+    monkeypatch.setattr(
+        mgr, "_restart_unbound",
+        lambda reason: restart_calls.append(reason) or {"ok": True, "error": ""})
 
     first = mgr._ensure_query_logging()
-    assert first is False  # newly written -> caller should reload
+    assert first == {"status": "restarted", "changed": True, "restarted": True,
+                     "ok": True, "reason": "logging-conf-written"}
     assert os.path.exists(um_mod.LOGGING_CONF)
     content = open(um_mod.LOGGING_CONF).read()
     assert "log-queries: yes" in content
@@ -150,14 +155,21 @@ def test_ensure_query_logging_writes_conf_once(tmp_path, monkeypatch, mgr):
     # never written and get_query_names()/get_stats() destination breakdown
     # stays permanently empty.
     assert "use-syslog: no" in content
+    assert restart_calls == ["query logging enabled"]
 
     second = mgr._ensure_query_logging()
-    assert second is True  # already matches -> no rewrite needed
+    assert second == {"status": "unchanged", "changed": False, "restarted": False,
+                      "ok": True, "reason": "already-enabled"}
 
 
 @patch("unbound_manager.subprocess.run")
-def test_get_stats_includes_query_names_and_reloads_on_first_enable(mock_run, tmp_path, monkeypatch, mgr):
+def test_get_stats_includes_query_names_and_skips_reload_after_restart(mock_run, tmp_path,
+                                                                       monkeypatch, mgr):
     _patch_paths(tmp_path, monkeypatch)
+    restart_calls = []
+    monkeypatch.setattr(
+        mgr, "_restart_unbound",
+        lambda reason: restart_calls.append(reason) or {"ok": True, "error": ""})
     mock_run.return_value = MagicMock(
         returncode=0,
         stdout="total.num.queries=10\ntotal.num.cachehits=5\ntotal.num.cachemiss=5\n"
@@ -175,11 +187,51 @@ def test_get_stats_includes_query_names_and_reloads_on_first_enable(mock_run, tm
     assert result["query_names"] == [{"name": "www.dwx.com", "type": "A", "count": 1,
                                        "sources": [{"ip": "1.1.1.1", "count": 1}]}]
     assert result["query_names_tracked"] == 1
-    # first call must have triggered the "reload" unbound-control invocation
-    # (query logging conf was freshly written) in addition to stats_noreset.
+    assert restart_calls == ["query logging enabled"]
     calls = [c.args[0] for c in mock_run.call_args_list]
-    assert ["unbound-control", "reload"] in calls
-    assert ["unbound-control", "stats_noreset"] in calls
+    assert calls == [["unbound-control", "stats_noreset"]]
+
+
+@patch("unbound_manager.time.sleep")
+@patch("unbound_manager.subprocess.run")
+def test_get_stats_retries_stats_after_same_call_restart(mock_run, _sleep, tmp_path, monkeypatch, mgr):
+    _patch_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        mgr, "_ensure_query_logging",
+        lambda: {"status": "restarted", "changed": True, "restarted": True,
+                 "ok": True, "reason": "logging-conf-written"})
+    first = MagicMock(returncode=1, stdout="", stderr="Unbound is not running")
+    second = MagicMock(returncode=0, stdout="total.num.queries=1\n", stderr="")
+    mock_run.side_effect = [first, second]
+
+    result = mgr.get_stats()
+
+    assert result["status"] == "SUCCESS"
+    assert [c.args[0] for c in mock_run.call_args_list] == [
+        ["unbound-control", "stats_noreset"],
+        ["unbound-control", "stats_noreset"],
+    ]
+
+
+@patch("unbound_manager.subprocess.run")
+def test_get_stats_reloads_when_query_logging_setup_failed_without_restart(mock_run, tmp_path,
+                                                                           monkeypatch, mgr):
+    _patch_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        mgr, "_ensure_query_logging",
+        lambda: {"status": "failed", "changed": True, "restarted": False,
+                 "ok": False, "reason": "restart-failed: boom"})
+    mock_run.return_value = MagicMock(returncode=0, stdout="total.num.queries=1\n", stderr="")
+    reload_calls = []
+    monkeypatch.setattr(
+        mgr, "_reload",
+        lambda: reload_calls.append("reload") or {"ok": True, "error": ""})
+
+    result = mgr.get_stats()
+
+    assert result["status"] == "SUCCESS"
+    assert reload_calls == ["reload"]
+    assert result["warning"] == "restart-failed: boom"
 
 
 @patch("unbound_manager.subprocess.run")
@@ -259,7 +311,9 @@ def test_get_stats_source_prefixes_threaded_through(mock_run, tmp_path, monkeypa
 
 def test_get_client_queries_filters_by_client_and_window(tmp_path, monkeypatch, mgr):
     _patch_paths(tmp_path, monkeypatch)
-    monkeypatch.setattr(mgr, "_ensure_query_logging", lambda: True)
+    monkeypatch.setattr(mgr, "_ensure_query_logging",
+                        lambda: {"status": "unchanged", "changed": False,
+                                 "restarted": False, "ok": True, "reason": "already-enabled"})
     now = int(time.time())
     with open(um_mod.QUERY_LOG, "w") as f:
         f.write(f"[{now - 30}] unbound[1:0] info: 172.17.1.5 a.dwx.com. A IN\n")
@@ -271,3 +325,42 @@ def test_get_client_queries_filters_by_client_and_window(tmp_path, monkeypatch, 
     out = mgr.get_client_queries("172.17.1.5", minutes=120)
     assert [q["name"] for q in out["queries"]] == ["a.dwx.com", "old.dwx.com"]
     assert mgr.get_client_queries("", minutes=5)["total"] == 2
+
+
+def test_get_client_queries_falls_back_to_journal_when_logfile_window_is_empty(
+        tmp_path, monkeypatch, mgr):
+    _patch_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(mgr, "_ensure_query_logging",
+                        lambda: {"status": "unchanged", "changed": False,
+                                 "restarted": False, "ok": True, "reason": "already-enabled"})
+    now = int(time.time())
+    with open(um_mod.QUERY_LOG, "w") as f:
+        f.write(f"[{now - 7200}] unbound[1:0] info: 172.17.1.5 old.dwx.com. A IN\n")
+    monkeypatch.setattr(
+        mgr, "_journal_events",
+        lambda minutes: [(now - 5, "172.17.1.5", "fresh.dwx.com", "A")])
+
+    out = mgr.get_client_queries(minutes=5)
+
+    assert out["source"] == "journal"
+    assert out["total"] == 1
+    assert [q["name"] for q in out["queries"]] == ["fresh.dwx.com"]
+
+
+def test_sync_skips_reload_when_query_logging_already_restarted_this_call(
+        tmp_path, monkeypatch, mgr):
+    _patch_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        mgr, "_ensure_query_logging",
+        lambda: {"status": "restarted", "changed": True, "restarted": True,
+                 "ok": True, "reason": "logging-conf-written"})
+    reload_calls = []
+    monkeypatch.setattr(
+        mgr, "_reload",
+        lambda: reload_calls.append("reload") or {"ok": True, "error": ""})
+
+    out = mgr.sync([{"name": "a.example.com", "type": "A", "value": "10.0.1.5", "ttl": 300}])
+
+    assert out["status"] == "SUCCESS"
+    assert out["reloaded"] is True
+    assert reload_calls == []
