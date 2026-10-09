@@ -410,11 +410,13 @@ class DNSSpoke(BaseSpoke):
         """Merge every member's per-client query log, newest first."""
         fan = await self._transport.fanout("DNSW_CLIENT_QUERIES", data, timeout=20.0)
         queries, errors = [], {}
+        successes = 0
         for member_id, reply in (fan.get("results") or {}).items():
             if not isinstance(reply, dict) or reply.get("status") != "SUCCESS":
                 errors[member_id] = ((reply.get("message") if isinstance(reply, dict) else None)
                                      or "no response")
                 continue
+            successes += 1
             for q in reply.get("queries") or []:
                 queries.append({**q, "resolver": member_id})
         queries.sort(key=lambda q: q.get("time", 0), reverse=True)
@@ -424,7 +426,10 @@ class DNSSpoke(BaseSpoke):
             summary[k] = summary.get(k, 0) + 1
         top = sorted(({"name": n, "type": t, "count": c} for (n, t), c in summary.items()),
                      key=lambda x: x["count"], reverse=True)[:100]
-        return {"status": "SUCCESS", "client": data.get("client", ""),
+        status = "SUCCESS"
+        if errors:
+            status = "PARTIAL" if successes else "ERROR"
+        return {"status": status, "client": data.get("client", ""),
                 "minutes": data.get("minutes", 10), "total": len(queries),
                 "queries": queries[:1000], "top_names": top, "cluster": True,
                 "member_errors": errors}
