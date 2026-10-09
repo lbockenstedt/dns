@@ -140,7 +140,10 @@ class UnboundManager:
 
         # Query logging is on by default: every sync (NetBox auto-sync runs
         # regularly) idempotently guarantees it, not just a WebUI stats view.
-        self._ensure_query_logging()
+        logging_result = self._ensure_query_logging()
+        if logging_result.get("restarted"):
+            logger.info("Synced %d DNS records to Unbound via restart", count)
+            return {"status": "SUCCESS", "records_written": count, "reloaded": True}
 
         reload_result = self._reload()
         if not reload_result["ok"]:
@@ -624,13 +627,24 @@ class UnboundManager:
             logger.warning("unbound-control reload failed: %s", e)
             return {"ok": False, "error": str(e)}
 
+    def _restart_unbound(self, reason: str) -> dict:
+        """Restart Unbound and report a structured outcome."""
+        try:
+            subprocess.run(["systemctl", "restart", "unbound"], check=True,
+                           capture_output=True, timeout=30)
+            logger.info("Unbound restarted (%s)", reason)
+            return {"ok": True, "error": ""}
+        except Exception as e:
+            logger.warning("unbound restart failed (%s): %s", reason, e)
+            return {"ok": False, "error": str(e)}
+
     def _ptr_name(self, ip: str) -> str:
         try:
             return ipaddress.ip_address(ip).reverse_pointer
         except ValueError:
             return ""
 
-    def _ensure_apparmor_log_access(self) -> bool:
+    def _ensure_apparmor_log_access(self) -> dict:
         """Let the confined ``unbound`` daemon create/write the query log.
 
         Debian/Ubuntu ship an AppArmor profile for unbound that does NOT allow
@@ -638,38 +652,51 @@ class UnboundManager:
         DENIED, so the logfile directive silently produces nothing (the lines go
         to the journal instead) and the per-destination breakdown stays empty
         forever even though the conf and directory ownership are correct. The
-        supported hook is the ``local/`` override. Returns True only when the
-        override was changed (profile reloaded + unbound restarted so it
-        reopens its logfile); a host without AppArmor is a no-op."""
+        supported hook is the ``local/`` override. The result distinguishes
+        no-op, successful apply/re-apply, and write/apply failures so callers
+        do not confuse "nothing to do" with "still broken"."""
         local_dir = "/etc/apparmor.d/local"
         profile = "/etc/apparmor.d/usr.sbin.unbound"
         rule = f"{os.path.dirname(QUERY_LOG)}/** rw,\n"
         if not os.path.isdir(local_dir) or not os.path.exists(profile):
-            return False
+            return {"status": "noop", "changed": False, "restarted": False,
+                    "ok": True, "reason": "apparmor-unavailable"}
         override = os.path.join(local_dir, "usr.sbin.unbound")
         try:
             current = open(override).read() if os.path.exists(override) else ""
-            if rule in current:
-                return False
-            with open(override, "a") as f:
-                if current and not current.endswith("\n"):
-                    f.write("\n")
-                f.write("# Managed by Lab Manager — unbound query log (DNS stats)\n" + rule)
+            changed = False
+            if rule not in current:
+                with open(override, "a") as f:
+                    if current and not current.endswith("\n"):
+                        f.write("\n")
+                    f.write("# Managed by Lab Manager — unbound query log (DNS stats)\n" + rule)
+                changed = True
         except Exception as e:
             logger.warning("could not update AppArmor override %s: %s", override, e)
-            return False
+            return {"status": "failed", "changed": False, "restarted": False,
+                    "ok": False, "reason": f"override-write-failed: {e}"}
+
+        rule_present_and_log_exists = rule in current and os.path.exists(QUERY_LOG)
+        if rule_present_and_log_exists:
+            return {"status": "noop", "changed": False, "restarted": False,
+                    "ok": True, "reason": "rule-already-active"}
         try:
             subprocess.run(["apparmor_parser", "-r", profile], check=True,
                            capture_output=True, timeout=30)
-            subprocess.run(["systemctl", "restart", "unbound"], check=True,
-                           capture_output=True, timeout=30)
+            restart = self._restart_unbound("AppArmor query-log access")
+            if not restart["ok"]:
+                return {"status": "failed", "changed": changed, "restarted": False,
+                        "ok": False, "reason": f"apply-failed: {restart['error']}"}
             logger.info("AppArmor: allowed unbound to write %s; profile reloaded, unbound restarted",
                         QUERY_LOG)
+            return {"status": "applied", "changed": changed, "restarted": True,
+                    "ok": True, "reason": "override-applied"}
         except Exception as e:
             logger.warning("AppArmor override written but reload/restart failed: %s", e)
-        return True
+            return {"status": "failed", "changed": changed, "restarted": False,
+                    "ok": False, "reason": f"apply-failed: {e}"}
 
-    def _ensure_query_logging(self) -> bool:
+    def _ensure_query_logging(self) -> dict:
         """Self-enable Unbound query logging on first use."""
         want = (f'server:\n    log-queries: yes\n'
                 f'    use-syslog: no\n    logfile: "{QUERY_LOG}"\n')
@@ -683,28 +710,46 @@ class UnboundManager:
                 pass
         except Exception as e:
             logger.warning("could not create unbound log dir: %s", e)
-        apparmor_changed = self._ensure_apparmor_log_access()
         try:
             current = open(LOGGING_CONF).read() if os.path.exists(LOGGING_CONF) else ""
         except Exception:
             current = ""
-        if current == want and not apparmor_changed:
-            return True
-        try:
-            with open(LOGGING_CONF, "w") as f:
-                f.write(want)
-            logger.info("Enabled unbound query logging via %s", LOGGING_CONF)
-        except Exception as e:
-            logger.warning("failed to write %s: %s", LOGGING_CONF, e)
-            return False
+        conf_changed = current != want
+        if conf_changed:
+            try:
+                with open(LOGGING_CONF, "w") as f:
+                    f.write(want)
+                logger.info("Enabled unbound query logging via %s", LOGGING_CONF)
+            except Exception as e:
+                logger.warning("failed to write %s: %s", LOGGING_CONF, e)
+                return {"status": "failed", "changed": False, "restarted": False,
+                        "ok": False, "reason": f"logging-conf-write-failed: {e}"}
+
+        apparmor_result = self._ensure_apparmor_log_access()
+        if not apparmor_result["ok"]:
+            return {"status": "failed",
+                    "changed": bool(conf_changed or apparmor_result["changed"]),
+                    "restarted": False, "ok": False,
+                    "reason": apparmor_result["reason"]}
+
         # ``logfile`` is only opened at startup; a reload leaves unbound
         # logging to its old destination, so the log would stay empty.
-        try:
-            subprocess.run(["systemctl", "restart", "unbound"], check=True,
-                           capture_output=True, timeout=30)
-        except Exception as e:
-            logger.warning("unbound restart after enabling query logging failed: %s", e)
-        return False
+        if conf_changed and not apparmor_result["restarted"]:
+            restart = self._restart_unbound("query logging enabled")
+            if not restart["ok"]:
+                return {"status": "failed", "changed": True, "restarted": False,
+                        "ok": False, "reason": f"restart-failed: {restart['error']}"}
+            return {"status": "restarted", "changed": True, "restarted": True,
+                    "ok": True, "reason": "logging-conf-written"}
+
+        if apparmor_result["restarted"]:
+            return {"status": "restarted",
+                    "changed": bool(conf_changed or apparmor_result["changed"]),
+                    "restarted": True, "ok": True,
+                    "reason": apparmor_result["reason"]}
+
+        return {"status": "unchanged", "changed": False, "restarted": False,
+                "ok": True, "reason": "already-enabled"}
 
     def _tail_query_log(self) -> None:
         """Incrementally parse newly-appended lines of the unbound query log."""
@@ -801,9 +846,11 @@ class UnboundManager:
                 except ValueError:
                     continue
         rows = []
+        saw_window_event = False
         for ts, ip, name, rtype in events:
             if ts < cutoff:
                 continue
+            saw_window_event = True
             if client and ip != client:
                 continue
             if needle and needle not in name:
@@ -816,6 +863,25 @@ class UnboundManager:
                 if not any(addr in n for n in nets):
                     continue
             rows.append({"time": ts, "client": ip, "name": name, "type": rtype})
+        if os.path.exists(QUERY_LOG) and not saw_window_event:
+            events = self._journal_events(minutes)
+            source = "journal"
+            rows = []
+            for ts, ip, name, rtype in events:
+                if ts < cutoff:
+                    continue
+                if client and ip != client:
+                    continue
+                if needle and needle not in name:
+                    continue
+                if nets is not None:
+                    try:
+                        addr = ipaddress.ip_address(ip)
+                    except ValueError:
+                        continue
+                    if not any(addr in n for n in nets):
+                        continue
+                rows.append({"time": ts, "client": ip, "name": name, "type": rtype})
         rows.sort(key=lambda r: r["time"], reverse=True)
         summary = {}
         for r in rows:
@@ -900,24 +966,40 @@ class UnboundManager:
         straight from unbound-control's own lifetime totals, which Unbound
         itself does not bucket by day."""
         reload_error = None
-
-        if not self._ensure_query_logging():
-            reload_result = self._reload()
-            if not reload_result.get("ok"):
-                reload_error = reload_result.get("error", "Unbound is not running")
+        logging_result = self._ensure_query_logging()
+        restarted = bool(logging_result.get("restarted"))
+        if not logging_result.get("ok"):
+            if not restarted:
+                reload_result = self._reload()
+                if not reload_result.get("ok"):
+                    reload_error = reload_result.get("error", "Unbound is not running")
+            if not reload_error:
+                reload_error = logging_result.get("reason", "query logging setup failed")
 
         query_names = self.get_query_names(search=search, source_prefixes=source_prefixes,
                                             range_days=range_days)
-        try:
-            result = subprocess.run(
-                ["unbound-control", "stats_noreset"],
-                capture_output=True, text=True, timeout=8,
-            )
-            if result.returncode != 0:
-                return {"status": "ERROR", "message": result.stderr.strip() or "unbound-control failed"}
-        except Exception as e:
-            logger.error("get_stats failed: %s", e)
-            return {"status": "ERROR", "message": str(e)}
+        attempts = 2 if restarted else 1
+        last_error = ""
+        for attempt in range(attempts):
+            try:
+                result = subprocess.run(
+                    ["unbound-control", "stats_noreset"],
+                    capture_output=True, text=True, timeout=8,
+                )
+            except Exception as e:
+                last_error = str(e)
+                if attempt + 1 < attempts:
+                    time.sleep(0.5)
+                    continue
+                logger.error("get_stats failed: %s", e)
+                return {"status": "ERROR", "message": str(e)}
+            if result.returncode == 0:
+                break
+            last_error = result.stderr.strip() or "unbound-control failed"
+            if attempt + 1 < attempts:
+                time.sleep(0.5)
+                continue
+            return {"status": "ERROR", "message": last_error}
 
         raw = {}
         for line in result.stdout.splitlines():
@@ -972,6 +1054,123 @@ class UnboundManager:
             response["warning"] = reload_error
 
         return response
+
+    def query_log_diagnostics(self) -> dict:
+        """Read-only evidence for why the query log / "Queries by Destination"
+        / per-client log might be empty. Never changes any state."""
+        info = {"query_log": QUERY_LOG, "logging_conf": LOGGING_CONF}
+        findings = []
+
+        def tail(path, n=8, size=65536):
+            try:
+                with open(path, "rb") as fh:
+                    fh.seek(0, os.SEEK_END)
+                    end = fh.tell()
+                    fh.seek(max(0, end - size))
+                    return fh.read().decode("utf-8", "replace").splitlines()[-n:]
+            except OSError:
+                return []
+
+        def stat_of(path):
+            try:
+                st = os.stat(path)
+            except OSError as e:
+                return {"exists": False, "error": str(e)}
+            owner = group = None
+            try:
+                import pwd, grp
+                owner = pwd.getpwuid(st.st_uid).pw_name
+                group = grp.getgrgid(st.st_gid).gr_name
+            except Exception:
+                pass
+            return {"exists": True, "size": st.st_size, "mode": oct(st.st_mode & 0o7777),
+                    "owner": owner, "group": group,
+                    "age_seconds": round(time.time() - st.st_mtime, 1)}
+
+        info["log_dir"] = stat_of(os.path.dirname(QUERY_LOG))
+        info["log_file"] = stat_of(QUERY_LOG)
+        log_tail = tail(QUERY_LOG)
+        info["log_tail"] = log_tail
+        info["log_tail_parsed"] = sum(1 for ln in log_tail if _QUERY_LOG_RE.search(ln))
+        try:
+            info["logging_conf_content"] = open(LOGGING_CONF).read()
+        except OSError as e:
+            info["logging_conf_content"] = None
+            findings.append(f"{LOGGING_CONF} is missing ({e}); logging was never enabled.")
+
+        conf_dir = os.path.dirname(self.conf_path)
+        try:
+            main_text = open(MAIN_CONF, encoding="utf-8").read()
+        except OSError:
+            main_text = ""
+        info["conf_dir_included"] = bool(
+            re.search(r"^\s*include(?:-toplevel)?:\s*\"?%s" % re.escape(conf_dir),
+                      main_text, re.M))
+        if not info["conf_dir_included"]:
+            findings.append(f"{MAIN_CONF} does not include {conf_dir}/*; lm-logging.conf is never read.")
+
+        # What the RUNNING daemon uses (not just what the file says).
+        for opt in ("log-queries", "logfile", "use-syslog"):
+            r = self._run_diag(["unbound-control", "get_option", opt])
+            info[f"running_{opt.replace('-', '_')}"] = (
+                r["output"].strip() if r["ok"] else (r["error"].strip() or "unavailable"))
+        cf = self._run_diag(["unbound-checkconf", "-o", "log-queries"])
+        info["configured_log_queries"] = cf["output"].strip() if cf["ok"] else (cf["error"].strip() or "unavailable")
+        cf = self._run_diag(["unbound-checkconf", "-o", "logfile"])
+        info["configured_logfile"] = cf["output"].strip() if cf["ok"] else (cf["error"].strip() or "unavailable")
+        ver = self._run_diag(["unbound", "-V"])
+        info["unbound_version"] = (ver["output"] or ver["error"]).splitlines()[0] if (ver["output"] or ver["error"]) else ""
+        pid = self._run_diag(["systemctl", "show", "-p", "ActiveEnterTimestamp", "--value", "unbound"])
+        info["unbound_active_since"] = pid["output"].strip()
+
+        # AppArmor: override present, profile mode, recent denials.
+        override = "/etc/apparmor.d/local/usr.sbin.unbound"
+        try:
+            ov = open(override).read()
+        except OSError:
+            ov = None
+        info["apparmor_profile_present"] = os.path.exists("/etc/apparmor.d/usr.sbin.unbound")
+        info["apparmor_override_present"] = ov is not None
+        info["apparmor_override_has_rule"] = bool(ov and f"{os.path.dirname(QUERY_LOG)}/**" in ov)
+        aa = self._run_diag(["aa-status"])
+        info["apparmor_unbound_status"] = ("loaded" if re.search(r"unbound", aa["output"])
+                                           else ("aa-status unavailable" if not aa["ok"] else "not loaded"))
+        den = self._run_diag(["journalctl", "-k", "--no-pager", "-n", "400", "-o", "cat"])
+        info["apparmor_denials"] = [ln.strip() for ln in den["output"].splitlines()
+                                    if "DENIED" in ln and "unbound" in ln][-5:]
+
+        # Journal fallback: is unbound logging queries there instead?
+        jr = self._run_diag(["journalctl", "-u", "unbound", "--no-pager", "-n", "300", "-o", "cat"])
+        jlines = jr["output"].splitlines()
+        info["journal_query_lines"] = sum(1 for ln in jlines if _QUERY_LOG_RE.search(ln))
+        info["journal_tail"] = [ln for ln in jlines if "info:" in ln or "error" in ln.lower()][-6:]
+
+        # In-memory state of this process.
+        info["memory"] = {
+            "events": len(self._query_events), "tracked_names": len(self._query_counts),
+            "log_offset": self._query_log_offset, "log_inode": self._query_log_inode,
+        }
+
+        if info["log_file"].get("exists") and info["log_file"].get("size", 0) == 0:
+            findings.append("Query log exists but is empty: unbound is not writing to it "
+                            "(check running logfile/log-queries below, and AppArmor).")
+        if not info["log_file"].get("exists"):
+            findings.append("Query log file does not exist: unbound never created it.")
+        if info["apparmor_denials"]:
+            findings.append("AppArmor is denying unbound; see denials below.")
+        if info["apparmor_profile_present"] and not info["apparmor_override_has_rule"]:
+            findings.append("AppArmor profile present but the lm override rule is missing.")
+        if str(info.get("running_log_queries", "")).lower() not in ("yes", "unavailable", ""):
+            findings.append("Running unbound has log-queries off; it needs a restart (not reload).")
+        if info["running_logfile"] and QUERY_LOG not in info["running_logfile"] \
+                and info["running_logfile"] != "unavailable":
+            findings.append(f"Running unbound logfile is {info['running_logfile']!r}, not {QUERY_LOG}.")
+        if info["journal_query_lines"] and not info["log_tail_parsed"]:
+            findings.append("Queries are appearing in the journal, not the logfile.")
+        if info["log_tail"] and not info["log_tail_parsed"]:
+            findings.append("Log has lines but none match the parser regex; see log_tail for the real format.")
+        info["findings"] = findings
+        return info
 
     def diagnostics(self) -> dict:
         """Return actionable Unbound service, config, listener, and query checks."""
@@ -1054,7 +1253,15 @@ class UnboundManager:
             "probes": probes,
             "recommendations": recommendations,
             "conf_path": self.conf_path,
+            "query_logging": self._safe_query_log_diagnostics(),
         }
+
+    def _safe_query_log_diagnostics(self) -> dict:
+        try:
+            return self.query_log_diagnostics()
+        except Exception as e:
+            logger.warning("query log diagnostics failed: %s", e)
+            return {"error": str(e), "findings": [f"query-log diagnostics failed: {e}"]}
 
     @staticmethod
     def _listener_host(line):

@@ -135,6 +135,10 @@ class FakeTransport:
                               "query_types": {"A": 10},
                               "query_names": [{"name": "www.dwx.com", "type": "A", "count": 4,
                                                 "sources": [{"ip": "172.17.1.5", "count": 4}]}]}
+            elif command == "DNSW_CLIENT_QUERIES":
+                results[m] = {"status": "SUCCESS", "queries": [
+                    {"time": 10, "client": "172.17.1.5",
+                     "name": "www.dwx.com", "type": "A"}]}
             else:
                 results[m] = {"status": "SUCCESS"}
         ok = [member for member, result in results.items()
@@ -259,6 +263,32 @@ def test_clustered_stats_merge_query_names_across_members(tmp_path):
     out = _run(spoke.handle_command("DNS_STATS", {}))
     assert out["query_names"] == [{"name": "www.dwx.com", "type": "A", "count": 8,
                                     "sources": [{"ip": "172.17.1.5", "count": 8}]}]
+
+
+def test_clustered_client_queries_is_partial_when_some_members_fail(tmp_path):
+    spoke = _spoke(tmp_path, ["dns-a", "dns-b"])
+    spoke._transport.fail_ops.add(("dns-b", "DNSW_CLIENT_QUERIES"))
+
+    out = _run(spoke.handle_command("DNS_CLIENT_QUERIES", {"minutes": 5}))
+
+    assert out["status"] == "PARTIAL"
+    assert out["total"] == 1
+    assert out["queries"][0]["resolver"] == "dns-a"
+    assert out["member_errors"] == {"dns-b": "worker unavailable"}
+
+
+def test_clustered_client_queries_is_error_when_every_member_fails(tmp_path):
+    spoke = _spoke(tmp_path, ["dns-a", "dns-b"])
+    spoke._transport.fail_ops.update({
+        ("dns-a", "DNSW_CLIENT_QUERIES"),
+        ("dns-b", "DNSW_CLIENT_QUERIES"),
+    })
+
+    out = _run(spoke.handle_command("DNS_CLIENT_QUERIES", {"minutes": 5}))
+
+    assert out["status"] == "ERROR"
+    assert out["total"] == 0
+    assert set(out["member_errors"]) == {"dns-a", "dns-b"}
 
 
 def test_clustered_stats_source_prefixes_is_forwarded_to_each_member(tmp_path):
