@@ -928,3 +928,17 @@ def test_a_failed_topology_save_restores_the_previous_worker_secret(tmp_path):
     # The save fails BEFORE the secret is staged, so nothing to restore — and
     # the PSK in force is still the original.
     assert plane.agent_secret == "original-psk"
+
+
+def test_clustered_stats_empty_source_prefixes_is_forwarded_so_members_fail_closed(tmp_path):
+    spoke = _spoke(tmp_path, ["dns-a", "dns-b"])
+    _run(spoke.handle_command("DNS_STATS", {"source_prefixes": []}))
+    stats_calls = [c for c in spoke._transport.sent if c[0] == "DNSW_STATS"]
+    assert stats_calls and stats_calls[0][1] == {"source_prefixes": []}
+
+
+def test_clustered_stats_without_source_prefixes_stays_unfiltered(tmp_path):
+    spoke = _spoke(tmp_path, ["dns-a", "dns-b"])
+    _run(spoke.handle_command("DNS_STATS", {}))
+    stats_calls = [c for c in spoke._transport.sent if c[0] == "DNSW_STATS"]
+    assert stats_calls and "source_prefixes" not in stats_calls[0][1]
