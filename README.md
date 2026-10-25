@@ -1,5 +1,7 @@
 # dns — Unbound DNS Spoke (Lab Manager Module)
 
+> **⚠️ RETIRED — do not change this repo.** The live dns code ships inside the lm repo at `lm/dns/` (installed under `/opt/lm/dns`; role has `repo_url: None`). All fixes from this repo were ported there. Make changes in `lbockenstedt/lm` → `dns/`. See `lm/docs/code-consolidation-backlog.md`.
+
 The `dns` spoke manages DNS records, upstream forwarding zones, resolver clustering, and live query analytics across one or more **Unbound** resolver workers within the Lab Manager (LM) hub-and-spoke infrastructure.
 
 ---

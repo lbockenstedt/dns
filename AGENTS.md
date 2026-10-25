@@ -1,5 +1,7 @@
 # AGENTS.md — `dns`
 
+> **⚠️ RETIRED — do not change this repo.** The live dns code ships inside the lm repo at `lm/dns/` (installed under `/opt/lm/dns`; role has `repo_url: None`). All fixes from this repo were ported there. Make changes in `lbockenstedt/lm` → `dns/`. See `lm/docs/code-consolidation-backlog.md`.
+
 **Unbound DNS module.**
 
 - **Repo:** `github.com/lbockenstedt/dns`
